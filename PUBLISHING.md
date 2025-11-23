@@ -90,15 +90,12 @@ cargo package --list
 cargo package
 ```
 
-这会在 `target/package/` 创建一个 `.crate` 文件。
+这会在 `target/package/` 创建一个 `.crate` 文件，并自动验证它可以正常构建。
 
-### 3.4 验证打包的 crate
-
+如果只想打包而不验证，使用：
 ```bash
-cargo package --verify
+cargo package --no-verify
 ```
-
-这会解压并构建打包的 crate，确保它可以正常工作。
 
 ## 4. 发布到 crates.io
 
@@ -120,6 +117,30 @@ cargo publish
 
 ```bash
 cargo publish --dry-run
+```
+
+### 4.4 使用国内镜像源的注意事项
+
+如果你的 `.cargo/config.toml` 配置了镜像源，发布时需要明确指定使用 crates.io：
+
+```bash
+# 干运行
+cargo publish --registry crates-io --dry-run
+
+# 正式发布
+cargo publish --registry crates-io
+```
+
+或者临时禁用镜像源配置：
+```bash
+# 重命名配置文件
+mv ~/.cargo/config.toml ~/.cargo/config.toml.bak
+
+# 发布
+cargo publish
+
+# 恢复配置
+mv ~/.cargo/config.toml.bak ~/.cargo/config.toml
 ```
 
 ## 5. 验证发布
@@ -351,7 +372,7 @@ chmod +x scripts/publish.sh
 - [ ] 运行 clippy (`cargo clippy`)
 - [ ] 检查格式 (`cargo fmt -- --check`)
 - [ ] 更新文档注释
-- [ ] 验证打包 (`cargo package --verify`)
+- [ ] 验证打包 (`cargo package`)
 - [ ] 发布到 crates.io (`cargo publish`)
 - [ ] 创建 GitHub Release
 - [ ] 验证安装 (`cargo add mailbox`)
@@ -386,7 +407,7 @@ chmod +x scripts/publish.sh
 **首次发布建议流程：**
 
 1. 确保 Cargo.toml 元数据完整
-2. 运行 `cargo package --verify`
+2. 运行 `cargo package` (会自动验证)
 3. 运行 `cargo publish --dry-run`
 4. 运行 `cargo publish`
 5. 验证 https://crates.io/crates/mailbox
