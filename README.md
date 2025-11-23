@@ -38,7 +38,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-mailbox = { path = "path/to/mailbox" }
+mboxlabs-mailbox = { path = "path/to/mailbox" }
 tokio = { version = "1", features = ["full"] }
 serde_json = "1"
 ```
@@ -46,8 +46,8 @@ serde_json = "1"
 ### Basic Example
 
 ```rust
-use mailbox::{Mailbox, OutgoingMail, MailMessage};
-use mailbox::providers::memory::MemoryProvider;
+use mboxlabs_mailbox::{Mailbox, OutgoingMail, MailMessage};
+use mboxlabs_mailbox::providers::memory::MemoryProvider;
 use serde_json::json;
 use std::collections::HashMap;
 
