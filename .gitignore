@@ -1,0 +1,35 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+
+# Cargo lock file (for libraries, don't commit)
+# For applications, you should commit Cargo.lock
+Cargo.lock
+
+# WASM build outputs
+/pkg/
+wasm-pack.log
+
+# IDE / Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Testing
+*.profraw
+*.profdata
+
+# Documentation
+/doc/
+
+# Backup files
+*.bak
+*.tmp
+
+# OS files
+Thumbs.db
+.Spotlight-V100
+.Trashes
