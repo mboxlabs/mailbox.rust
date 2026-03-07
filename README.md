@@ -57,7 +57,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut mailbox = Mailbox::new();
     mailbox.register_provider(Box::new(MemoryProvider::new()));
 
-    // 2. Subscribe to an address and define message handler
+    // 2. Start the mailbox (initializes providers)
+    mailbox.start().await?;
+
+    // 3. Subscribe to an address and define message handler
     let subscription = mailbox.subscribe(
         "mem:service@example.com/inbox".parse()?,
         Box::new(|message| {
@@ -70,7 +73,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Mailbox established, listening on 'mem:service@example.com/inbox'...");
 
-    // 3. Send a message to that address
+    // 4. Send a message to that address
     mailbox.post(OutgoingMail {
         id: None,
         from: "mem:client@example.com/user-1".parse()?,
@@ -79,6 +82,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         headers: HashMap::new(),
         meta: HashMap::new(),
     }).await?;
+
+    // 5. Clean up: Unsubscribe and stop the mailbox (releases resources)
+    subscription.unsubscribe().await?;
+    mailbox.stop().await?;
 
     // Give async tasks time to complete
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -175,6 +182,13 @@ Implement the `MailboxProvider` trait to create custom providers:
 #[async_trait]
 pub trait MailboxProvider: Send + Sync {
     fn protocol(&self) -> &str;
+
+    /// Optional: Initialize connections, pre-warm caches
+    async fn init(&self) -> Result<()> { Ok(()) }
+
+    /// Optional: Specific closing logic, release resources
+    async fn close(&self) -> Result<()> { Ok(()) }
+
     async fn send(&self, message: MailMessage) -> Result<MailMessage>;
     async fn subscribe(
         &self,

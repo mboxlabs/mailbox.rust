@@ -29,6 +29,20 @@ impl AckableMessage {
 pub trait MailboxProvider: Send + Sync {
     fn protocol(&self) -> &str;
 
+    /**
+     * 初始化 Provider。用于建立连接、验证配置等。
+     */
+    async fn init(&self) -> Result<()> {
+        Ok(())
+    }
+
+    /**
+     * 关闭 Provider。用于释放资源、断开连接等。
+     */
+    async fn close(&self) -> Result<()> {
+        Ok(())
+    }
+
     async fn send(&self, message: MailMessage) -> Result<MailMessage>;
 
     async fn subscribe(
