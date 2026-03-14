@@ -172,6 +172,25 @@ println!("State: {}", status.state);
 println!("Unread: {:?}", status.unread_count);
 ```
 
+### 4. Accessing Providers
+
+You can gracefully access registered providers via the `providers()` getter or `get_provider()` method:
+
+```rust
+// Get all providers (returns a reference to HashMap)
+let all_providers = mailbox.providers();
+if all_providers.contains_key("mem") {
+    println!("Memory provider is registered");
+}
+
+// Get a specific provider
+// protocol can be "mem" or "mem:"
+let provider = mailbox.get_provider("mem", false).unwrap();
+
+// Get provider or return error if not found
+let slack_provider = mailbox.get_provider("slack", true)?;
+```
+
 ## 🏗️ Architecture
 
 ### Provider Trait

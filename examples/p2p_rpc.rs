@@ -1,5 +1,5 @@
-use mailbox::{Mailbox, OutgoingMail, MailMessage};
-use mailbox::providers::memory::MemoryProvider;
+use mboxlabs_mailbox::{Mailbox, OutgoingMail, MailMessage};
+use mboxlabs_mailbox::providers::memory::MemoryProvider;
 use serde_json::json;
 use std::collections::HashMap;
 use std::time::Duration;
