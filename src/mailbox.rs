@@ -3,8 +3,7 @@ use std::sync::Arc;
 use url::Url;
 use crate::error::{MailboxError, Result};
 use crate::message::{MailMessage, OutgoingMail, MailboxStatus, FetchOptions};
-use crate::provider::{MailboxProvider, Subscription, AckableMessage};
-use futures::future::BoxFuture;
+use crate::provider::{MailboxProvider, Subscription, AckableMessage, SubscriptionHandler};
 
 #[derive(Clone)]
 pub struct Mailbox {
@@ -111,10 +110,13 @@ impl Mailbox {
         provider.send(message).await
     }
 
+    /**
+     * 订阅。回调返回 `Err` 时由 provider 按可重试判定回队或丢弃。
+     */
     pub async fn subscribe(
         &self,
         address: Url,
-        callback: Box<dyn Fn(MailMessage) -> BoxFuture<'static, ()> + Send + Sync>,
+        callback: SubscriptionHandler,
     ) -> Result<Box<dyn Subscription>> {
         let provider = self.get_provider_or_fail(address.scheme())?;
         provider.subscribe(address, callback).await

@@ -66,8 +66,13 @@ impl From<OutgoingMail> for MailMessage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MailboxStatus {
     pub state: String,
+    /// 队列中等待被取走的消息数（含被重投的），即 `fetch` 能取到的数量。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unread_count: Option<usize>,
+    /// 已取走但尚未 ack 的消息数。与 unread_count 分列，
+    /// 否则 in-flight 消息在状态里隐形，会被当作已处理完。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub in_flight_count: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_activity_time: Option<String>,
     #[serde(flatten)]
@@ -77,6 +82,10 @@ pub struct MailboxStatus {
 #[derive(Debug, Clone)]
 pub struct FetchOptions {
     pub manual_ack: bool,
+    /**
+     * 手动 ACK 下的 in-flight 超时（毫秒）。
+     * `None` → 用 `DEFAULT_ACK_TIMEOUT`（30s）；`Some(0)` → 关闭超时，消息常驻 in-flight 直到 ack/nack。
+     */
     pub ack_timeout: Option<u64>,
 }
 

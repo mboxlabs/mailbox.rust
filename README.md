@@ -67,6 +67,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Box::pin(async move {
                 println!("Received message! From: {}", message.from);
                 println!("Content: {:?}", message.body);
+                Ok(())
             })
         })
     ).await?;
@@ -116,7 +117,18 @@ A mailbox address consists of three parts:
 
 ## 🎯 Core Features
 
-### 1. Subscribe Pattern (Push)
+There are two ways to receive mail, and one message goes to **one of them only**, decided
+when `post()` runs:
+
+| State of the address when `post()` runs | Where the message goes |
+|------|------|
+| at least one active subscriber | handed to every subscriber's callback; **not** queued, so `fetch()` gets nothing |
+| no subscriber | queued; `fetch()` gets it, subscribers get nothing |
+
+Mutually exclusive per message: a message already handed to a subscriber can never be
+fetched, and a queued message is never replayed to a subscriber that appears later.
+
+### 1. Subscribe
 
 ```rust
 let subscription = mailbox.subscribe(
@@ -124,6 +136,7 @@ let subscription = mailbox.subscribe(
     Box::new(|msg| {
         Box::pin(async move {
             println!("Got: {:?}", msg.body);
+            Ok(())
         })
     })
 ).await?;
@@ -132,7 +145,19 @@ let subscription = mailbox.subscribe(
 subscription.unsubscribe().await?;
 ```
 
-### 2. Fetch Pattern (Pull)
+The callback returns `Result<()>`. An `Err` decides the message's fate through
+`MailboxError::is_retriable()`: `MailboxError::Retriable(..)` or a `Transport` error whose
+code is `503 / 504 / ECONNRESET / ETIMEDOUT` puts the message back in the queue, where
+`fetch()` can pick it up; anything else is dropped, so one bad message is not retried
+forever. Same rule as the TypeScript and Python sides.
+
+```rust
+Box::new(|_| Box::pin(async {
+    Err(MailboxError::Retriable("upstream down".to_string())) // → 回到队列，计入 unread_count
+}))
+```
+
+### 2. Fetch
 
 **Auto-acknowledgment:**
 ```rust
@@ -164,13 +189,28 @@ if let Some(msg) = msg {
 }
 ```
 
+`ack_timeout` 的三态语义（与 TS / Python 端一致）：
+
+| 传值 | 含义 |
+|------|------|
+| `None`（缺省） | 用 `DEFAULT_ACK_TIMEOUT`（30 秒），未 ack 的消息会重新入队 |
+| `Some(t)`，`t > 0` | 该超时（毫秒） |
+| `Some(Duration::ZERO)` | 关闭 stale 扫描，消息常驻 in-flight 直到 ack/nack |
+
+不传 ≠ 永不超时：否则崩溃的消费者会把消息永久卡在 in-flight。
+
 ### 3. Status Query
 
 ```rust
 let status = mailbox.status("mem:service/inbox".parse()?).await?;
 println!("State: {}", status.state);
-println!("Unread: {:?}", status.unread_count);
+println!("Unread: {:?}", status.unread_count);              // 仍在队列里等待
+println!("In flight: {:?}", status.in_flight_count);        // 已取出、尚未 ack/nack
+println!("Subscribers: {:?}", status.extra.get("subscriber_count"));
 ```
+
+`unread_count` 只统计队列里等待的消息；`manual_ack: true` 取出的消息单独计入
+`in_flight_count`，一直不 ack 会回到队列。
 
 ### 4. Accessing Providers
 
@@ -190,6 +230,43 @@ let provider = mailbox.get_provider("mem", false).unwrap();
 // Get provider or return error if not found
 let slack_provider = mailbox.get_provider("slack", true)?;
 ```
+
+### 5. Subscriber Failures and Retry (opt-in)
+
+The subscription callback returns `Result<()>`. A retriable error (`MailboxError::Retriable`,
+or a `Transport` error whose code is `503 / 504 / ECONNRESET / ETIMEDOUT`) requeues the
+message so `fetch()` can pick it up; anything else is dropped, so one bad message is not
+retried forever.
+
+By default nothing calls the callback again. Opt into automatic redelivery:
+
+```rust
+use std::time::Duration;
+use mboxlabs_mailbox::RetryPolicy;
+use mboxlabs_mailbox::providers::memory::MemoryProvider;
+
+let provider = MemoryProvider::with_retry(Some(RetryPolicy::new(3, Duration::from_millis(1000))));
+```
+
+Only the failing subscriber is re-invoked — subscribing is a broadcast, and re-broadcasting
+would run the side effects of the subscribers that already succeeded a second time. Attempts
+are counted per (subscriber, message); when the budget runs out the message goes back to the
+queue, and unsubscribing while a retry is pending returns it to the queue as well. A message
+is never queued twice: `requeue()` skips one that is already queued or in flight.
+
+Retry is opt-in because AMQP / SQS style transports already redeliver and ship dead-letter
+queues; retrying on top of them would double-deliver. `MemoryProvider::new()` keeps the
+default: requeue, no automatic redelivery.
+
+Two caveats specific to this port: there is no exhausted hook yet (the attempt ledger is
+cleared and the message is requeued — the trait has no place for a callback, so dead-lettering
+stays in user code around `fetch()`), and on `wasm32` the backoff degrades to "retry without
+waiting" because tokio's `time` feature is unavailable on that target. `max_attempts` still
+bounds the loop.
+
+The policy pieces live in `mboxlabs_mailbox::retry` (`RetryPolicy`, `next_retry_delay`,
+`AttemptLedger`) and are re-exported from the crate root, so other packages can reuse the same
+backoff and accounting; the retriable check there is `MailboxError::is_retriable()`.
 
 ## 🏗️ Architecture
 
@@ -212,7 +289,7 @@ pub trait MailboxProvider: Send + Sync {
     async fn subscribe(
         &self,
         address: Url,
-        callback: Box<dyn Fn(MailMessage) -> BoxFuture<'static, ()> + Send + Sync>
+        callback: SubscriptionHandler   // Box<dyn Fn(MailMessage) -> BoxFuture<'static, Result<()>>>
     ) -> Result<Box<dyn Subscription>>;
     async fn fetch(&self, address: Url, options: FetchOptions) -> Result<Option<AckableMessage>>;
     async fn status(&self, address: Url) -> Result<MailboxStatus>;
@@ -220,12 +297,24 @@ pub trait MailboxProvider: Send + Sync {
 }
 ```
 
+There is no base class in Rust, so the parts the TypeScript / Python base classes share live in
+free functions and helpers: `handle_subscription_error()` logs a failed callback and reports
+whether it should be requeued, and `retry::{RetryPolicy, next_retry_delay, AttemptLedger}` holds
+the retry math. A provider that supports subscriptions is expected to:
+
+1. call the user callback and inspect its `Result<()>`;
+2. on a retriable error, put the message back with `queue.requeue()` (deduplicated — the queue
+   keeps one copy no matter how many subscribers failed);
+3. optionally retry **only the failing subscriber** when a `RetryPolicy` is configured.
+
 ### Built-in Providers
 
 - **MemoryProvider**: In-memory message bus for local communication
   - Topic-based routing
   - FIFO queue with manual/auto acknowledgment
-  - Stale message requeueing
+  - Stale message requeueing, with requeue deduplication (a message is never queued twice)
+  - Opt-in subscription retry (`RetryPolicy`); by default a failed subscriber only requeues
+    the message and nothing re-invokes the callback
   - Thread-safe singleton event bus
 
 ## 🌐 WASM Support
@@ -277,6 +366,10 @@ Tests include:
 - Fetch with manual-ack
 - Nack with requeue
 - Concurrent access
+- In-flight visibility in `status()` and stale in-flight recovery
+- Requeue deduplication and the retry helpers (`retry.rs`)
+- Opt-in subscription retry: targeted redelivery, exhausted budget falls back to the queue,
+  unsubscribing during a pending retry requeues the message
 
 ## 📚 Examples
 

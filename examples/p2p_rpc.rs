@@ -1,4 +1,5 @@
 use mboxlabs_mailbox::{Mailbox, OutgoingMail, MailMessage};
+use mboxlabs_mailbox::error::MailboxError;
 use mboxlabs_mailbox::providers::memory::MemoryProvider;
 use serde_json::json;
 use std::collections::HashMap;
@@ -19,10 +20,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Box::pin(async move {
             println!("[Service] Received request: {:?}", msg.body);
 
+            // 订阅回调现在返回 Result：返回 Err 且可重试时消息会退回队列（与 TS / Python 一致），
+            // 而不是像以前那样失败后静默丢失。
+            let args = match msg.body["args"].as_array() {
+                Some(args) => args.clone(),
+                None => return Err(MailboxError::Retriable("missing args".to_string())),
+            };
             let op = msg.body["op"].as_str().unwrap_or("");
-            let args = msg.body["args"].as_array().unwrap();
-            let a = args[0].as_i64().unwrap_or(0);
-            let b = args[1].as_i64().unwrap_or(0);
+            let a = args.get(0).and_then(|v| v.as_i64()).unwrap_or(0);
+            let b = args.get(1).and_then(|v| v.as_i64()).unwrap_or(0);
 
             let result = match op {
                 "add" => a + b,
@@ -45,6 +51,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Err(e) = mailbox.post(reply).await {
                 eprintln!("[Service] Failed to send reply: {}", e);
             }
+
+            Ok(())
         })
     })).await?;
 
@@ -61,6 +69,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Some(tx) = tx.lock().unwrap().take() {
                 let _ = tx.send(msg);
             }
+            Ok(())
         })
     })).await?;
 
