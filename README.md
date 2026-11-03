@@ -115,6 +115,46 @@ A mailbox address consists of three parts:
 - **`user@physical_address`**: The **globally unique, protocol-agnostic ID** of the logical mailbox or service. The same physical address can be accessed via different protocols (e.g., `mem:api@myservice.com` and `mailto:api@myservice.com` point to the same logical entity).
 - **`/logical_address`** (optional): An optional path for internal routing. For example, when combined with `tool-rpc`, it can route messages to specific tools within a larger service, allowing one physical address to serve as a unified gateway for multiple logical functions.
 
+### Address rules: no query, no hash
+
+The topic a message is delivered to is the address's **canonical id**:
+`protocol://user@host[:port]/path` (password stripped, port kept). Addresses that would lose
+information in that normalization are **rejected**, not trimmed (issue#4):
+
+```rust
+// mem:q@example.com/inbox?thread=1 and mem:q@example.com/inbox are two logical addresses,
+// but they share one canonical id — one queue, one delivery path, the merge invisible to callers.
+mailbox.status("mem:q@example.com/inbox?thread=1".parse()?).await?;
+// Err(MailboxError::InvalidMailboxAddress { code: "MBX_INVALID_ADDRESS", .. })
+// "... query \"?thread=1\" would be dropped by address canonicalization, silently merging
+//  this address with \"mem://q@example.com/inbox\" ..."
+```
+
+| Rule | Why |
+|------|------|
+| `?query` and `#fragment` (empty ones included) are rejected at every entry (`post` / `subscribe` / `fetch` / `peek` / `status`) | silently merging two business flows into one queue is worse than a hard error |
+| Logical partitions belong in the **path**: `mem:host/inbox/thread-1` | the path is what survives canonicalization |
+| `mem:alice@example.com/inbox` and `mem://alice@example.com/inbox` are the **same** address | one canonical form, and canonicalization is idempotent |
+| A canonical id can be parsed back into an address | that is how `snapshot()` re-queries every address it lists |
+| Percent-encoded markers stay legal: `mem:host/inbox%3Fthread%3D1` | `%3F` / `%23` are path content, not separators |
+
+Errors are typed and carry stable codes (`MailboxError::code()`), matching the TypeScript
+`src/error.ts` and Python `error.py` codes: `MBX_INVALID_ADDRESS`, `MBX_INVALID_FETCH_OPTIONS`,
+`MBX_UNSUPPORTED_CAPABILITY`, `MBX_NO_PROVIDER`. Match on the variant or `code()`, never on the
+message — messages are for humans and change.
+
+`Mailbox` entries take `Url` (already parsed), so they run the lossless check; code that starts
+from a string should go through `parse_mailbox_address("mem:…", "post()")`, which also turns a
+non-parseable string into `InvalidMailboxAddress`.
+
+> **Upgrading from 0.1.x.** The topic key (canonical id) now keeps the `//` and the port —
+> `mem://a@example.com:8080/inbox`, the same string the TypeScript and Python ports compute — so
+> `get_canonical_mailbox_address_identifier()` returns `Result<String>` (a lossy address is an
+> error, not a trimmed id). `MailboxStatus` gained `exists`, and `last_activity_time` is now
+> serialized as `null` instead of being skipped; `FetchOptions` gained `peek` / `limit`;
+> `MailboxProvider` gained the optional `peek` / `list_addresses`; `Mailbox` gained `peek()` and
+> `snapshot()`.
+
 ## 🎯 Core Features
 
 There are two ways to receive mail, and one message goes to **one of them only**, decided
@@ -214,18 +254,78 @@ if let Some(msg) = msg {
 
 不传 ≠ 永不超时：否则崩溃的消费者会把消息永久卡在 in-flight。
 
+**Read-only peek.** 诊断 / 审计需要「看一眼但不消费」。之前最接近的做法是 `manual_ack: true`
+取一封然后不 ack —— 消息会进 in-flight（默认 30s 后重投），既不是只读，也会干扰真正消费者的
+`unread_count` / `in_flight_count`（issue#4）。现在用 `peek()`：
+
+```rust
+let snapshot = mailbox.peek("mem:service/inbox".parse()?, None).await?;        // 整个队列
+let head = mailbox.peek("mem:service/inbox".parse()?, Some(5)).await?;        // 最多 5 条
+
+for message in &snapshot {
+    println!("{}", message.id); // 副本：改它们改不到队列里的消息
+}
+```
+
+保证（与 TS / Python 的 `fetch(addr, { peek: true, limit })` 同一组语义）：
+
+- 返回**副本**数组（空队列 / 未知地址是空 `Vec`，不是 `None`）；不出队、不建 in-flight、
+  不跑 stale 扫描、不刷 `last_activity_time`；
+- 只涵盖**等待中**的消息 —— in-flight 属于那个消费者，只在 `status().in_flight_count` 里可见；
+- provider 不具备只读能力时报 `MailboxError::UnsupportedCapability`，不会退化成取信；
+- `FetchOptions { peek: true, .. }` 送进 `fetch()` 会直接报错（`peek` + `manual_ack` 则报
+  “contradictory”）—— 绝不静默降级成取信。
+
+本端口把两者拆成两个方法，因为 Rust 的返回类型是静态的：取信 `Option<AckableMessage>`，
+快照 `Vec<MailMessage>`。字段 `FetchOptions.peek` / `FetchOptions.limit` 保留着（对齐 TS /
+Python 的选项形状），但 `fetch()` 会拒绝它们。Rust 的 `usize` 已在编译期排除负数与小数，
+所以 TS / Python 里的 `limit` 校验在这里是类型保证。
+
 ### 3. Status Query
 
 ```rust
 let status = mailbox.status("mem:service/inbox".parse()?).await?;
-println!("State: {}", status.state);
+println!("State: {}", status.state);                       // online | unknown | offline | degraded
+println!("Exists: {:?}", status.exists);                   // provider 认不认这个地址
 println!("Unread: {:?}", status.unread_count);              // 仍在队列里等待
 println!("In flight: {:?}", status.in_flight_count);        // 已取出、尚未 ack/nack
+println!("Last activity: {:?}", status.last_activity_time); // ISO 8601；无活动 = None（JSON `null`）
 println!("Subscribers: {:?}", status.extra.get("subscriber_count"));
 ```
 
 `unread_count` 只统计队列里等待的消息；`manual_ack: true` 取出的消息单独计入
 `in_flight_count`，一直不 ack 会回到队列。
+
+**Status 必须诚实**（issue#4）：
+
+| 情况 | 返回 |
+|------|------|
+| 地址从没被碰过（没投过、没订阅过、没活动） | `state: "unknown"` + `exists: Some(false)` + `extra.message`（**不是** `online` + 0） |
+| 队列被取空了 / 只有订阅者 | `state: "online"` + `exists: Some(true)`（「空闲」与「不存在」是两件事） |
+| provider 答不了 status | `state: "unknown"`，`exists` **不设**（问不到 ≠ 不存在） |
+| 没有活动记录 | `last_activity_time: None` —— 序列化后是 `null`，不是整个字段消失 |
+
+`status()` 只读：不会刷新 `last_activity_time`，否则一个几秒一轮询的诊断页会把空闲地址永远刷成
+「刚刚有活动」。
+
+**Full snapshot** — 一时刻整个 `Mailbox`（所有 provider、所有 topic）的诊断视图，等价于 TS /
+Python 里不传地址的 `status()`（Rust 没有可选参数，所以名字直接到位）：
+
+```rust
+let snap = mailbox.snapshot().await?;
+println!("{} addresses, {} unread, {} in flight", snap.address_count, snap.unread_count, snap.in_flight_count);
+for entry in &snap.addresses {
+    println!("{} [{}] {:?}", entry.canonical_id, entry.protocol, entry.status.unread_count);
+}
+println!("not covered: {:?}", snap.unsupported_providers);
+```
+
+- `addresses` 按 `canonical_id` 排序，`protocols` / `unsupported_providers` 同理 —— 快照可重复，
+  断言可写死；每条 entry 的 `canonical_id` 可以再解析回地址复查（`status(canonical_id)`）。
+- `state`：`online`（都能枚举且都在线）/ `degraded`（有 provider 枚举不了，或某个地址不在线）/
+  `unknown`（没有任何 provider 能枚举，包括一个都没注册）。
+- 消息不在本地的 broker（AMQP / SQS 那一类）列在 `unsupported_providers` 里，不会被误报成
+  「队列为空」。
 
 ### 4. Accessing Providers
 
@@ -350,7 +450,16 @@ pub trait MailboxProvider: Send + Sync {
     ) -> Result<Box<dyn Subscription>>;
     async fn fetch(&self, address: Url, options: FetchOptions) -> Result<Option<AckableMessage>>;
 
-    /// Optional: defaults to `state: "unknown"`
+    /// Optional: read-only snapshot (copies; no dequeue, no in-flight, no activity bump).
+    /// Defaults to `Err(UnsupportedCapability)` — never a silently consuming fetch.
+    async fn peek(&self, address: Url, limit: Option<usize>) -> Result<Vec<MailMessage>> { /* … */ }
+
+    /// Optional: canonical ids of the addresses this provider knows (`Mailbox::snapshot()` reads it).
+    /// Defaults to `Err(UnsupportedCapability)` → listed in `unsupported_providers`.
+    async fn list_addresses(&self) -> Result<Vec<String>> { /* … */ }
+
+    /// Optional: defaults to `state: "unknown"` with `exists` left **unset**
+    /// ("cannot ask" is not "does not exist").
     async fn status(&self, address: Url) -> Result<MailboxStatus> { /* … */ }
     fn generate_id(&self) -> String;
 }
@@ -403,11 +512,22 @@ and logs a warning naming the provider.
 `handle_subscription_error()` remains for providers that deliberately do their own handling; with
 `ProviderCore` it would double-handle the same failure.
 
+Diagnostics capabilities are opt-in and fail loudly: a provider that does not implement `peek`
+answers `MailboxError::UnsupportedCapability` instead of degrading into a consuming fetch, and a
+provider that cannot enumerate its topics is reported in `MailboxSnapshot::unsupported_providers`
+instead of contributing an empty queue. `fetch` implementations should call
+`reject_peek_in_fetch(&options)` at the top (`MemoryProvider` does): the TypeScript / Python base
+class routes `peek` away from `_fetch`, Rust has no base class, and `fetch()` must never receive a
+`peek` option it would silently ignore.
+
 ### Built-in Providers
 
 - **MemoryProvider**: In-memory message bus for local communication
   - Topic-based routing
   - FIFO queue with manual/auto acknowledgment
+  - Read-only `peek(addr, limit)` (copies, no dequeue / in-flight / activity bump) and address
+    enumeration (`list_addresses()`), which is what `Mailbox::snapshot()` reads
+  - `status()` answers `exists` — an address it has never seen is `unknown`, not `online` + 0
   - Stale message requeueing, with requeue deduplication (a message is never queued twice)
   - Per-delivery settlement on top of `ProviderCore`: partial failure is not requeued, only a
     broadcast nobody succeeded goes back to the queue (one copy)
@@ -478,6 +598,18 @@ Tests include:
   slowest delivery, `post()` does not await settlement, unsubscribing never concludes for an
   in-flight callback, same-id concurrent posts settle independently, and the watchdog bounds
   stuck callbacks without cutting a healthy retry chain or the backoff
+- Address rules (`utils.rs` + `mailbox.rs` + `providers/memory.rs`), mirroring the TypeScript
+  `mailbox.address-canonicalization.test.ts`: query / hash (empty ones included) are rejected at
+  every entry with a typed error naming the topic they would have merged into, opaque and
+  hierarchical spellings resolve to one topic, canonical ids are idempotent and re-parseable, and
+  logical partitions in the path stay separate queues
+- Status honesty and the snapshot (`mailbox.rs`): `exists` separates "never seen" from "idle",
+  `last_activity_time` survives JSON as `null`, read-only calls never bump it, a provider that
+  cannot answer status leaves `exists` unset, and `snapshot()` aggregates topics across providers
+  in a deterministic order while listing non-enumerable ones as `unsupported_providers`
+- Read-only peek (`providers/queue.rs` + `providers/memory.rs` + `mailbox.rs`): copies, no dequeue,
+  no in-flight, no stale scan, no activity bump, `limit` covers the head only, in-flight messages
+  stay out of the snapshot, and a provider without the capability errors instead of consuming
 
 ## 📚 Examples
 

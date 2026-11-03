@@ -2,15 +2,17 @@ use crate::core::{DeadLetterHook, ProviderCore, ProviderCoreOptions};
 use crate::delivery::DeliveryResult;
 use crate::error::Result;
 use crate::message::{FetchOptions, MailMessage, MailboxStatus};
-use crate::provider::{AckableMessage, MailboxProvider, Subscription, SubscriptionHandler};
+use crate::provider::{
+    reject_peek_in_fetch, AckableMessage, MailboxProvider, Subscription, SubscriptionHandler,
+};
 use crate::providers::queue::MailMessageQueue;
 use crate::retry::RetryPolicy;
-use crate::utils::get_canonical_mailbox_address_identifier;
+use crate::utils::{get_canonical_mailbox_address_identifier, normalize_peek_limit};
 
 use async_trait::async_trait;
 use futures::future::BoxFuture;
 use once_cell::sync::Lazy;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use url::Url;
@@ -43,6 +45,43 @@ fn touch(topic: &str) {
         .unwrap()
         .last_activity
         .insert(topic.to_string(), chrono::Utc::now().to_rfc3339());
+}
+
+/// 【只读】取一份队列快照（副本），不出队、不建 in-flight、不刷活动时间。
+///
+/// 注意：这里**不**写 `last_activity`。只读诊断不该把一个空闲地址刷成“刚刚有活动”，
+/// 否则一个每隔几秒轮询一次的诊断页会让 `last_activity_time` 永远假绿。
+fn peek(topic: &str, limit: Option<usize>) -> Vec<MailMessage> {
+    BUS.read().unwrap().queue.peek(topic, limit)
+}
+
+/// 这份总线认不认这个 topic：有过订阅、有过活动记录，或现在 / 曾有未结算的消息。
+///
+/// 这是 `status().exists` 的依据。“地址不存在”与“地址空闲但确实存在”在诊断上是两件事
+/// （issue#4）：前者 `exists: false` / `state: "unknown"`，后者 `exists: true` / `state: "online"`。
+fn knows(bus: &MemoryEventBus, topic: &str) -> bool {
+    bus.topics.contains_key(topic)
+        || bus.last_activity.contains_key(topic)
+        || bus.queue.has_topic(topic)
+}
+
+/// 这份总线上所有“认得”的 topic（订阅过 / 有过活动 / 有消息），按字典序排序。
+/// 供 [`crate::Mailbox::snapshot`]（不传地址的 `status()`）做全量快照。
+fn list_topics() -> Vec<String> {
+    let bus = BUS.read().unwrap();
+    let mut known: HashSet<&str> = HashSet::new();
+    for topic in bus.topics.keys() {
+        known.insert(topic.as_str());
+    }
+    for topic in bus.last_activity.keys() {
+        known.insert(topic.as_str());
+    }
+
+    let mut topics: Vec<String> = known.into_iter().map(str::to_string).collect();
+    topics.extend(bus.queue.topics());
+    topics.sort();
+    topics.dedup();
+    topics
 }
 
 /// 发布一条消息：有订阅者时交给订阅回调，否则入队等待 fetch 取回。
@@ -86,7 +125,7 @@ fn memory_nack_hook() -> crate::core::NackHook {
             if !requeue {
                 return Ok(());
             }
-            let topic = get_canonical_mailbox_address_identifier(&message.to);
+            let topic = get_canonical_mailbox_address_identifier(&message.to)?;
             touch(&topic);
             BUS.write().unwrap().queue.requeue(topic, message);
             Ok(())
@@ -186,7 +225,7 @@ impl MailboxProvider for MemoryProvider {
     ///
     /// barrier 必须同步登记（任何 await 之前），否则派发时同步失败的投递会先看到“无 barrier”。
     async fn _send(&self, message: MailMessage) -> Result<()> {
-        let topic = get_canonical_mailbox_address_identifier(&message.to);
+        let topic = get_canonical_mailbox_address_identifier(&message.to)?;
         let deliveries = match publish(&topic, message.clone()) {
             Some(deliveries) => deliveries,
             None => return Ok(()), // 没有订阅者：消息入队，由 fetch / ack 那套语义负责
@@ -200,7 +239,7 @@ impl MailboxProvider for MemoryProvider {
         address: Url,
         callback: SubscriptionHandler,
     ) -> Result<Box<dyn Subscription>> {
-        let topic = get_canonical_mailbox_address_identifier(&address);
+        let topic = get_canonical_mailbox_address_identifier(&address)?;
 
         // 对齐 TS / Python 的 MailboxProvider.subscribe：core 保存原始回调并驱动隐式 ack、
         // 错误处理、重试与投递结算；这里只负责把 core 给的监听器挂到总线上。
@@ -235,7 +274,10 @@ impl MailboxProvider for MemoryProvider {
     }
 
     async fn fetch(&self, address: Url, options: FetchOptions) -> Result<Option<AckableMessage>> {
-        let topic = get_canonical_mailbox_address_identifier(&address);
+        // 入口先挡住 `peek: true`：不能把只读快照当消费型取件跑。
+        reject_peek_in_fetch(&options)?;
+
+        let topic = get_canonical_mailbox_address_identifier(&address)?;
         touch(&topic);
 
         if !options.manual_ack {
@@ -270,21 +312,59 @@ impl MailboxProvider for MemoryProvider {
         Ok(None)
     }
 
+    /// 只读快照：副本，不动队列、不建 in-flight、不刷活动时间。
+    ///
+    /// 之前没有这个能力：想“看一眼”只能 `fetch(..., manual_ack: true)` 不 ack，消息就进了
+    /// in-flight（默认 30s 后重投），既干扰正常消费者的计数，也不是只读（issue#4）。
+    async fn peek(&self, address: Url, limit: Option<usize>) -> Result<Vec<MailMessage>> {
+        let topic = get_canonical_mailbox_address_identifier(&address)?;
+        Ok(peek(&topic, normalize_peek_limit(limit)))
+    }
+
+    /// 本总线认得的地址（canonical id）—— `mem:` 的消息就在本地，所以能枚举。
+    async fn list_addresses(&self) -> Result<Vec<String>> {
+        Ok(list_topics())
+    }
+
     async fn status(&self, address: Url) -> Result<MailboxStatus> {
-        let topic = get_canonical_mailbox_address_identifier(&address);
+        let topic = get_canonical_mailbox_address_identifier(&address)?;
         let bus = BUS.read().unwrap();
 
+        let exists = knows(&bus, &topic);
         let unread_count = bus.queue.get_status(&topic);
         // in-flight 消息已离开队列但尚未确认，单独报出来，否则 status 会把它们当作已处理完。
         let in_flight_count = bus.queue.in_flight_count(&topic);
         let subscriber_count = bus.topics.get(&topic).map(|l| l.len()).unwrap_or(0);
+        // 只读：这里不写 `last_activity`（诊断页轮询不该把空闲地址刷成“刚刚有活动”）。
         let last_activity_time = bus.last_activity.get(&topic).cloned();
+        drop(bus);
 
         let mut extra = HashMap::new();
         extra.insert("subscriber_count".to_string(), serde_json::json!(subscriber_count));
 
+        if !exists {
+            // 对“这个地址从不存在”回 `online` + 0，诊断页就分不出「不存在」和「空闲」（issue#4）。
+            extra.insert(
+                "message".to_string(),
+                serde_json::json!(format!(
+                    "No queue, subscription or activity is known for '{}'.",
+                    topic
+                )),
+            );
+
+            return Ok(MailboxStatus {
+                state: "unknown".to_string(),
+                exists: Some(false),
+                unread_count: Some(unread_count),
+                in_flight_count: Some(in_flight_count),
+                last_activity_time,
+                extra,
+            });
+        }
+
         Ok(MailboxStatus {
             state: "online".to_string(),
+            exists: Some(true),
             unread_count: Some(unread_count),
             in_flight_count: Some(in_flight_count),
             last_activity_time,
@@ -305,7 +385,7 @@ mod tests {
     use crate::error::MailboxError;
     use crate::message::OutgoingMail;
     use crate::provider::SubscriptionStatus;
-    use serde_json::json;
+    use serde_json::{json, Value};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
 
@@ -434,6 +514,7 @@ mod tests {
         let options = FetchOptions {
             manual_ack: true,
             ack_timeout: None,
+            ..Default::default()
         };
 
         let fetched = provider.fetch(address.clone(), options.clone()).await?;
@@ -473,6 +554,7 @@ mod tests {
         let options = FetchOptions {
             manual_ack: true,
             ack_timeout: None,
+            ..Default::default()
         };
 
         let fetched = provider.fetch(address.clone(), options.clone()).await?;
@@ -578,7 +660,7 @@ mod tests {
         assert_eq!(initial.unread_count, Some(1));
         assert_eq!(initial.in_flight_count, Some(0));
 
-        let options = FetchOptions { manual_ack: true, ack_timeout: Some(5000) };
+        let options = FetchOptions { manual_ack: true, ack_timeout: Some(5000), ..Default::default() };
         let fetched = provider.fetch(address.clone(), options).await?.unwrap();
 
         // 旧行为：in-flight 消息在状态里完全隐形
@@ -608,7 +690,7 @@ mod tests {
         provider.send(mail.into()).await?;
 
         // 消费者“崩溃”：取走后不 ack
-        let options = FetchOptions { manual_ack: true, ack_timeout: Some(20) };
+        let options = FetchOptions { manual_ack: true, ack_timeout: Some(20), ..Default::default() };
         assert!(provider.fetch(address.clone(), options.clone()).await?.is_some());
         assert!(provider.fetch(address.clone(), options.clone()).await?.is_none());
 
@@ -1566,6 +1648,394 @@ mod tests {
         Ok(())
     }
 
+    // --- issue#4：地址规则 / 诚实的 status / 只读 peek -------------------------------------
+    //
+    // 与 TS `src/mailbox.peek.test.ts` + `src/mailbox.status-diagnostics.test.ts` +
+    // `src/mailbox.address-canonicalization.test.ts`、Python `tests/test_*.py` 同一组不变量。
+    // 注：`mem:` 的总线仍是进程级单例（issue#3 的实例隔离未背移到 Rust），所以每个测试用
+    // 自己唯一的 topic 名。
+
+    async fn post_body(provider: &MemoryProvider, to: &Url, id: &str, body: Value) -> Result<()> {
+        provider
+            .send(OutgoingMail {
+                id: Some(id.to_string()),
+                from: "mem:rust-bus/sender".parse()?,
+                to: to.clone(),
+                body,
+                headers: HashMap::new(),
+                meta: HashMap::new(),
+            }.into())
+            .await?;
+        Ok(())
+    }
+
+    fn ok_handler() -> SubscriptionHandler {
+        Box::new(|_| Box::pin(async { Ok(()) }))
+    }
+
+    /// `unwrap_err()` 要求 Ok 类型是 `Debug`（`AckableMessage` / `Subscription` 不是），这里只要错误。
+    fn expect_err<T, E: std::fmt::Debug>(result: std::result::Result<T, E>) -> E {
+        match result {
+            Ok(_) => panic!("期望报错，结果却是 Ok"),
+            Err(error) => error,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_peek_returns_copies_without_consuming_anything() -> Result<()> {
+        let provider = MemoryProvider::new();
+        let address: Url = "mem:rust-bus/peek-basic".parse()?;
+
+        post_body(&provider, &address, "peek-1", json!({ "n": 1 })).await?;
+        post_body(&provider, &address, "peek-2", json!({ "n": 2 })).await?;
+
+        let snapshot = provider.peek(address.clone(), None).await?;
+        assert_eq!(
+            snapshot.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            ["peek-1", "peek-2"]
+        );
+
+        let status = provider.status(address.clone()).await?;
+        assert_eq!(status.unread_count, Some(2)); // 不出队
+        assert_eq!(status.in_flight_count, Some(0)); // 也不建 in-flight
+
+        // 反复快照稳定；改副本改不到队列里的对象（Rust 的 `Clone` 即深拷贝）。
+        let mut copy = snapshot[0].clone();
+        copy.body = json!({ "tampered": true });
+        assert_eq!(provider.peek(address.clone(), None).await?[0].body, json!({ "n": 1 }));
+
+        // 消息仍能被 FIFO 取走。
+        assert_eq!(
+            provider.fetch(address.clone(), FetchOptions::default()).await?.unwrap().message.id,
+            "peek-1"
+        );
+        assert_eq!(
+            provider.fetch(address.clone(), FetchOptions::default()).await?.unwrap().message.id,
+            "peek-2"
+        );
+        assert!(provider.fetch(address.clone(), FetchOptions::default()).await?.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_peek_limit_covers_the_head_only() -> Result<()> {
+        let provider = MemoryProvider::new();
+        let address: Url = "mem:rust-bus/peek-limit".parse()?;
+        for n in 1..=3 {
+            post_body(&provider, &address, &format!("limit-{}", n), json!({ "n": n })).await?;
+        }
+
+        assert!(provider.peek(address.clone(), Some(0)).await?.is_empty());
+        assert_eq!(
+            provider.peek(address.clone(), Some(2)).await?
+                .iter().map(|m| m.body["n"].as_i64().unwrap()).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(provider.peek(address.clone(), Some(usize::MAX)).await?.len(), 3);
+        assert_eq!(provider.peek(address.clone(), None).await?.len(), 3);
+        assert_eq!(provider.status(address.clone()).await?.unread_count, Some(3)); // limit 不消耗消息
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_peek_covers_only_waiting_messages() -> Result<()> {
+        let provider = MemoryProvider::new();
+        let address: Url = "mem:rust-bus/peek-vs-inflight".parse()?;
+        post_body(&provider, &address, "inflight-1", json!({ "n": 1 })).await?;
+        post_body(&provider, &address, "inflight-2", json!({ "n": 2 })).await?;
+
+        let options = FetchOptions { manual_ack: true, ack_timeout: None, ..Default::default() };
+        let inflight = provider.fetch(address.clone(), options).await?.unwrap();
+        assert_eq!(inflight.message.body, json!({ "n": 1 }));
+
+        // 不会把另一个消费者手上的消息也列出来。
+        assert_eq!(
+            provider.peek(address.clone(), None).await?
+                .iter().map(|m| m.body["n"].as_i64().unwrap()).collect::<Vec<_>>(),
+            vec![2]
+        );
+
+        inflight.nack(true).await?;
+        assert_eq!(provider.peek(address.clone(), None).await?.len(), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_peek_and_status_do_not_refresh_last_activity_time() -> Result<()> {
+        // 诊断页轮询不会把空闲地址刷成“刚刚有活动”。
+        let provider = MemoryProvider::new();
+        let address: Url = "mem:rust-bus/peek-activity".parse()?;
+        post_body(&provider, &address, "activity-1", json!({ "n": 1 })).await?;
+
+        let before = provider.status(address.clone()).await?;
+        assert!(before.last_activity_time.is_some());
+
+        provider.peek(address.clone(), None).await?;
+        provider.peek(address.clone(), Some(1)).await?;
+        let after = provider.status(address.clone()).await?;
+
+        assert_eq!(after.last_activity_time, before.last_activity_time);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_an_address_that_was_never_touched_is_unknown() -> Result<()> {
+        let provider = MemoryProvider::new();
+        let status = provider.status("mem:rust-bus/never-touched".parse()?).await?;
+
+        assert_eq!(status.state, "unknown"); // 不是“online + 0”
+        assert_eq!(status.exists, Some(false));
+        assert_eq!(status.unread_count, Some(0));
+        assert_eq!(status.in_flight_count, Some(0));
+        assert_eq!(status.last_activity_time, None);
+        assert_eq!(status.extra["subscriber_count"], json!(0));
+        assert!(status.extra["message"]
+            .as_str()
+            .unwrap()
+            .contains("No queue, subscription or activity is known"));
+
+        // `last_activity_time` 必须是 `null` 而不是「字段消失」：否则 JSON 一轮之后诊断页就
+        // 拿不到这个概念了。
+        let wire: HashMap<String, Value> = serde_json::from_str(&serde_json::to_string(&status)?)?;
+        assert!(wire.contains_key("last_activity_time"));
+        assert!(wire["last_activity_time"].is_null());
+        assert_eq!(wire["exists"], json!(false));
+        assert_eq!(wire["state"], json!("unknown"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_drained_but_real_is_still_online() -> Result<()> {
+        // “存在但空闲”与“不存在”是两回事。
+        let provider = MemoryProvider::new();
+        let address: Url = "mem:rust-bus/drained".parse()?;
+        post_body(&provider, &address, "drained-1", json!({ "n": 1 })).await?;
+        provider.fetch(address.clone(), FetchOptions::default()).await?;
+
+        let status = provider.status(address).await?;
+        assert_eq!(status.exists, Some(true));
+        assert_eq!(status.state, "online");
+        assert_eq!(status.unread_count, Some(0)); // 空闲
+        assert!(status.last_activity_time.is_some());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_an_address_with_only_a_subscriber_exists_too() -> Result<()> {
+        let provider = MemoryProvider::new();
+        let address: Url = "mem:rust-bus/subscribed-only".parse()?;
+        let _sub = provider.subscribe(address.clone(), ok_handler()).await?;
+
+        let status = provider.status(address).await?;
+        assert_eq!(status.exists, Some(true));
+        assert_eq!(status.state, "online");
+        assert_eq!(status.extra["subscriber_count"], json!(1));
+        assert_eq!(status.unread_count, Some(0));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_in_flight_messages_keep_an_address_existing() -> Result<()> {
+        let provider = MemoryProvider::new();
+        let address: Url = "mem:rust-bus/inflight-exists".parse()?;
+        post_body(&provider, &address, "inflight-exists-1", json!({ "n": 1 })).await?;
+        provider
+            .fetch(address.clone(), FetchOptions { manual_ack: true, ..Default::default() })
+            .await?;
+
+        let status = provider.status(address).await?;
+        assert_eq!(status.exists, Some(true));
+        assert_eq!(status.unread_count, Some(0));
+        assert_eq!(status.in_flight_count, Some(1));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_query_and_hash_addresses_are_rejected_at_every_entry() -> Result<()> {
+        // 绕过 `Mailbox` 直接用 provider 也拦得住：canonicalization 自己就是防线。
+        let provider = MemoryProvider::new();
+        let with_query: Url = "mem:rust-bus/reject?thread=1".parse()?;
+        let with_hash: Url = "mem:rust-bus/reject#frag".parse()?;
+
+        let error = expect_err(provider
+            .send(MailMessage {
+                id: "direct-1".to_string(),
+                from: "mem:rust-bus/sender".parse()?,
+                to: with_query.clone(),
+                body: json!({}),
+                headers: HashMap::new(),
+                meta: HashMap::new(),
+            })
+            .await);
+        assert_eq!(error.code(), Some("MBX_INVALID_ADDRESS"));
+        assert!(error.to_string().contains("would be dropped by address canonicalization"));
+
+        assert_eq!(
+            expect_err(provider.subscribe(with_query.clone(), ok_handler()).await).code(),
+            Some("MBX_INVALID_ADDRESS")
+        );
+        assert_eq!(
+            expect_err(provider.fetch(with_hash.clone(), FetchOptions::default()).await).code(),
+            Some("MBX_INVALID_ADDRESS")
+        );
+        assert_eq!(
+            expect_err(provider.status(with_query.clone()).await).code(),
+            Some("MBX_INVALID_ADDRESS")
+        );
+        // peek 不是绕过地址校验的后门。
+        assert_eq!(
+            expect_err(provider.peek(with_query.clone(), None).await).code(),
+            Some("MBX_INVALID_ADDRESS")
+        );
+
+        // 旧行为：不带 query 的 status 也会看到这封信（两条业务流共用一条队列）。
+        let status = provider.status("mem:rust-bus/reject".parse()?).await?;
+        assert_eq!(status.exists, Some(false));
+        assert_eq!(status.unread_count, Some(0));
+        assert_eq!(status.extra["subscriber_count"], json!(0));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_logical_partitions_live_in_the_path() -> Result<()> {
+        let provider = MemoryProvider::new();
+        let thread_one: Url = "mem:rust-bus/partitions/inbox/thread-1".parse()?;
+        let thread_two: Url = "mem:rust-bus/partitions/inbox/thread-2".parse()?;
+
+        post_body(&provider, &thread_one, "part-1", json!({ "thread": 1 })).await?;
+        post_body(&provider, &thread_two, "part-2", json!({ "thread": 2 })).await?;
+
+        assert_eq!(provider.status(thread_one.clone()).await?.unread_count, Some(1));
+        assert_eq!(provider.status(thread_two.clone()).await?.unread_count, Some(1));
+
+        // 取一个分区不会动到另一个分区。
+        let fetched = provider.fetch(thread_one.clone(), FetchOptions::default()).await?.unwrap();
+        assert_eq!(fetched.message.body, json!({ "thread": 1 }));
+        assert_eq!(provider.status(thread_one).await?.unread_count, Some(0));
+        assert_eq!(provider.status(thread_two.clone()).await?.unread_count, Some(1));
+        assert_eq!(
+            provider.fetch(thread_two, FetchOptions::default()).await?.unwrap().message.body,
+            json!({ "thread": 2 })
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_opaque_and_hierarchical_spellings_are_the_same_address() -> Result<()> {
+        let provider = MemoryProvider::new();
+        post_body(&provider, &"mem:rust-bus/eq-spelling/inbox".parse()?, "eq-1", json!({ "n": 1 })).await?;
+
+        let hierarchical: Url = "mem://rust-bus/eq-spelling/inbox".parse()?;
+        assert_eq!(provider.status(hierarchical.clone()).await?.unread_count, Some(1));
+        assert_eq!(
+            provider.fetch(hierarchical, FetchOptions::default()).await?.unwrap().message.body,
+            json!({ "n": 1 })
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_peek_in_fetch_is_rejected_not_silently_consumed() -> Result<()> {
+        let provider = MemoryProvider::new();
+        let address: Url = "mem:rust-bus/peek-conflict".parse()?;
+        post_body(&provider, &address, "conflict-1", json!({ "n": 1 })).await?;
+
+        let error = expect_err(
+            provider
+                .fetch(address.clone(), FetchOptions { peek: true, manual_ack: true, ..Default::default() })
+                .await,
+        );
+        assert_eq!(error.code(), Some("MBX_INVALID_FETCH_OPTIONS"));
+        assert!(error.to_string().contains("contradictory"));
+
+        let status = provider.status(address).await?;
+        assert_eq!(status.unread_count, Some(1)); // 报错没消耗消息
+        assert_eq!(status.in_flight_count, Some(0)); // 也没偷偷建 in-flight
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_provider_without_peek_reports_unsupported_and_keeps_the_message() -> Result<()> {
+        // 不支持只读快照的传输型 provider：必须报错，不能退化成取件。
+        let provider = RawBroadcastProvider::new();
+        let address: Url = "raw:rust-bus/inbox".parse()?;
+        provider
+            .send(MailMessage {
+                id: "raw-1".to_string(),
+                from: "raw:rust-bus/sender".parse()?,
+                to: address.clone(),
+                body: json!({ "n": 1 }),
+                headers: HashMap::new(),
+                meta: HashMap::new(),
+            })
+            .await?;
+
+        let error = expect_err(provider.peek(address.clone(), None).await);
+        assert_eq!(error.code(), Some("MBX_UNSUPPORTED_CAPABILITY"));
+        match error {
+            MailboxError::UnsupportedCapability { protocol, capability } => {
+                assert_eq!(protocol, "raw");
+                assert!(capability.contains("read-only peek"), "{}", capability);
+            }
+            other => panic!("期望 UnsupportedCapability，得到 {:?}", other),
+        }
+        assert_eq!(provider.queued(&address), 1); // 关键：没有“以为在只读、实际被取走”
+
+        // 枚举能力同理（`Mailbox::snapshot` 会把它归入 unsupported_providers）。
+        assert_eq!(
+            expect_err(provider.list_addresses().await).code(),
+            Some("MBX_UNSUPPORTED_CAPABILITY")
+        );
+        // 直接用 `fetch(peek: true)` 也不会被静默降级。
+        assert_eq!(
+            expect_err(provider.fetch(address.clone(), FetchOptions { peek: true, ..Default::default() }).await).code(),
+            Some("MBX_INVALID_FETCH_OPTIONS")
+        );
+        assert_eq!(provider.queued(&address), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn test_bus_level_knowledge_and_topic_enumeration() {
+        // 总线层的同一套语义（对应 Python 的 `MemoryEventBus.knows` / `list_topics`）。
+        let subscribed = "mem://rust-bus/list-a";
+        let queued = "mem://rust-bus/list-b";
+        let never = "mem://rust-bus/list-never";
+
+        {
+            let bus = BUS.read().unwrap();
+            assert!(!knows(&bus, never));
+        }
+
+        publish(
+            queued,
+            MailMessage {
+                id: "list-b-1".to_string(),
+                from: "mem:rust-bus/sender".parse().unwrap(),
+                to: queued.parse().unwrap(),
+                body: json!({}),
+                headers: HashMap::new(),
+                meta: HashMap::new(),
+            },
+        );
+        BUS.write().unwrap().topics.entry(subscribed.to_string()).or_default();
+
+        let topics = list_topics();
+        assert!(topics.contains(&subscribed.to_string()), "{:?}", topics);
+        assert!(topics.contains(&queued.to_string()), "{:?}", topics);
+        assert!(!topics.contains(&never.to_string()));
+        let mut sorted = topics.clone();
+        sorted.sort();
+        assert_eq!(topics, sorted); // 快照与测试断言需要确定性
+
+        {
+            let bus = BUS.read().unwrap();
+            assert!(knows(&bus, subscribed)); // 只订阅也算“这个地址有人用”
+            assert!(knows(&bus, queued));
+            assert!(!knows(&bus, never));
+        }
+    }
+
     /// 第三方广播 provider 的常见写法：`_send` 里把消息派发出去，但**丢弃**了每次投递的结算
     /// future（没接 `track_broadcast_settlement`）。投递级记账把回队判定搬到了 barrier 上，
     /// 于是这类 provider 的可重试失败会静默消失 —— core 必须兜住。
@@ -1588,7 +2058,7 @@ mod tests {
                         let queue = queue_for_nack.clone();
                         Box::pin(async move {
                             if requeue {
-                                let topic = get_canonical_mailbox_address_identifier(&message.to);
+                                let topic = get_canonical_mailbox_address_identifier(&message.to)?;
                                 queue.lock().unwrap().requeue(topic, message);
                             }
                             Ok(())
@@ -1604,7 +2074,7 @@ mod tests {
             self.queue
                 .lock()
                 .unwrap()
-                .get_status(&get_canonical_mailbox_address_identifier(address))
+                .get_status(&get_canonical_mailbox_address_identifier(address).unwrap())
         }
     }
 
@@ -1615,7 +2085,7 @@ mod tests {
         }
 
         async fn _send(&self, message: MailMessage) -> Result<()> {
-            let topic = get_canonical_mailbox_address_identifier(&message.to);
+            let topic = get_canonical_mailbox_address_identifier(&message.to)?;
             let listeners = self.topics.read().unwrap().get(&topic).cloned().unwrap_or_default();
             if listeners.is_empty() {
                 self.queue.lock().unwrap().enqueue(topic, message);
@@ -1634,7 +2104,7 @@ mod tests {
             address: Url,
             callback: SubscriptionHandler,
         ) -> Result<Box<dyn Subscription>> {
-            let topic = get_canonical_mailbox_address_identifier(&address);
+            let topic = get_canonical_mailbox_address_identifier(&address)?;
             let (sub_id, listener) = self.core.register_subscription(address, callback);
             self.topics
                 .write()
@@ -1658,8 +2128,11 @@ mod tests {
             Ok(self.core.subscription_object(sub_id))
         }
 
-        async fn fetch(&self, address: Url, _options: FetchOptions) -> Result<Option<AckableMessage>> {
-            let topic = get_canonical_mailbox_address_identifier(&address);
+        async fn fetch(&self, address: Url, options: FetchOptions) -> Result<Option<AckableMessage>> {
+            // 这个第三方写法示范：入口必须挡住 `peek`，否则只读快照会被静默当成取件。
+            reject_peek_in_fetch(&options)?;
+
+            let topic = get_canonical_mailbox_address_identifier(&address)?;
             let message = self.queue.lock().unwrap().dequeue(&topic);
             Ok(message.map(|message| AckableMessage {
                 message,
@@ -1668,9 +2141,12 @@ mod tests {
             }))
         }
 
+        // 没有 `peek` / `list_addresses`：保留 trait 默认实现，用来验证
+        // 「不支持只读要报错」与「枚举不了要进 unsupported_providers」两条护栏。
         async fn status(&self, address: Url) -> Result<MailboxStatus> {
             Ok(MailboxStatus {
                 state: "online".to_string(),
+                exists: Some(true),
                 unread_count: Some(self.queued(&address)),
                 in_flight_count: None,
                 last_activity_time: None,

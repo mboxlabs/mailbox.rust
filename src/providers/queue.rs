@@ -1,6 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 use crate::message::Identifiable;
+use crate::utils::{copy_for_peek, normalize_peek_limit};
 
 /// 手动 ACK 模式下未指定 `ack_timeout` 时的默认超时。
 ///
@@ -86,9 +87,60 @@ where T: Clone + Identifiable
     }
 
     /// 队列里等待投递的消息数。只有这个数可以当作“待处理”；
-    /// in-flight 的消息未 ack 时会回到队列，用 [`in_flight_count`] 单独观测。
+    /// in-flight 的消息未 ack 时会回到队列，用 [`in_flight_count`](Self::in_flight_count) 单独观测。
     pub fn get_status(&self, topic: &str) -> usize {
         self.queues.get(topic).map(|q| q.len()).unwrap_or(0)
+    }
+
+    /// 【只读】看一眼队列头部最多 `limit` 条消息，**不**改动任何投递状态。
+    ///
+    /// 诊断 / 审计需要「看一眼但不消费」。在这之前最接近的做法是 `fetch(..., manual_ack = true)`
+    /// 然后不 ack（issue#4）：那会把消息弄进 in-flight（默认 30s 后重投），既不是只读，
+    /// 也会干扰正常消费者的 `unread_count` / `in_flight_count`。
+    ///
+    /// 保证：
+    /// - 不出队、不建 in-flight、不动 stale 扇描、不改任何时间戳；
+    /// - 返回副本（见 [`crate::utils::copy_for_peek`]），调用方改不到队列里的对象；
+    /// - 只涵盖**等待中**的消息；in-flight（已被消费者取走、尚未 ack）不在快照里 ——
+    ///   它属于那个消费者，只能在 `status().in_flight_count` 里看到。
+    ///
+    /// @param topic 要快照的 topic。
+    /// @param limit 最多返回几条；`None` 则整个队列。
+    /// @returns 按 FIFO 顺序的消息副本数组；队列为空 / topic 未知时是空数组（不是 `None`）。
+    pub fn peek(&self, topic: &str, limit: Option<usize>) -> Vec<T> {
+        let limit = normalize_peek_limit(limit);
+        let queue = match self.queues.get(topic) {
+            Some(queue) if !queue.is_empty() => queue,
+            _ => return Vec::new(),
+        };
+
+        let count = limit.unwrap_or(queue.len()).min(queue.len());
+        // iter().take()：不取走、不反转、不重新排序；副本见 `copy_for_peek`。
+        queue.iter().take(count).map(copy_for_peek).collect()
+    }
+
+    /// 这个 topic 在队列里有没有痕迹（等待中的消息或 in-flight）。
+    /// 与 [`has`](Self::has)（按消息 id）不同：这是按 topic 的「存不存在」，用于 status 的 `exists`。
+    pub fn has_topic(&self, topic: &str) -> bool {
+        if self.queues.get(topic).map(|q| !q.is_empty()).unwrap_or(false) {
+            return true;
+        }
+        self.in_flight.values().any(|flight| flight.topic == topic)
+    }
+
+    /// 当前有消息（等待中或 in-flight）的 topic 列表，按字典序排序
+    /// （快照与测试断言需要确定性）。
+    pub fn topics(&self) -> Vec<String> {
+        let mut known: Vec<String> = self
+            .queues
+            .iter()
+            .filter(|(_, queue)| !queue.is_empty())
+            .map(|(topic, _)| topic.clone())
+            .collect();
+        known.extend(self.in_flight.values().map(|flight| flight.topic.clone()));
+        known.sort();
+        known.dedup();
+        known
     }
 
     /// 已交给消费者、尚未 ack/nack 的消息数。
@@ -258,6 +310,126 @@ mod tests {
         q.nack("again", true);
         assert_eq!(q.get_status("t"), 1);
         assert!(q.has("again"));
+    }
+
+    #[test]
+    fn peek_leaves_no_trace_and_returns_the_head_in_fifo_order() {
+        let mut q = MailMessageQueue::new();
+        q.enqueue("t".to_string(), msg("msg-1"));
+        q.enqueue("t".to_string(), msg("msg-2"));
+
+        let snapshot = q.peek("t", None);
+        assert_eq!(snapshot.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["msg-1", "msg-2"]);
+
+        // 关键：快照完全不留痕迹。
+        assert_eq!(q.get_status("t"), 2);
+        assert_eq!(q.in_flight_count("t"), 0);
+        assert!(q.has("msg-1"));
+        // 反复 peek 稳定，且消息仍能被正常取走。
+        assert_eq!(q.peek("t", None).len(), 2);
+        assert_eq!(q.dequeue("t").unwrap().id, "msg-1");
+    }
+
+    #[test]
+    fn peek_of_an_empty_queue_or_unknown_topic_is_an_empty_vec() {
+        let q: MailMessageQueue<TestMessage> = MailMessageQueue::new();
+        assert!(q.peek("t", None).is_empty());
+        assert!(q.peek("never-seen", Some(3)).is_empty());
+    }
+
+    #[test]
+    fn peek_covers_the_head_only_and_does_not_consume() {
+        let mut q = MailMessageQueue::new();
+        for id in ["msg-1", "msg-2", "msg-3"] {
+            q.enqueue("t".to_string(), msg(id));
+        }
+
+        assert!(q.peek("t", Some(0)).is_empty());
+        assert_eq!(
+            q.peek("t", Some(2)).iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            ["msg-1", "msg-2"]
+        );
+        assert_eq!(q.peek("t", Some(usize::MAX)).len(), 3);
+        assert_eq!(q.get_status("t"), 3); // limit 不消耗消息
+    }
+
+    #[test]
+    fn peek_does_not_look_at_in_flight_messages() {
+        let mut q = MailMessageQueue::new();
+        q.enqueue("t".to_string(), msg("msg-1"));
+        q.enqueue("t".to_string(), msg("msg-2"));
+        q.dequeue_for_ack("t", Some(Duration::from_secs(30)));
+
+        assert_eq!(q.peek("t", None).iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["msg-2"]);
+        assert_eq!(q.get_status("t"), 1);
+        assert_eq!(q.in_flight_count("t"), 1);
+
+        q.nack("msg-1", true);
+        assert_eq!(
+            q.peek("t", None).iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            ["msg-1", "msg-2"]
+        );
+    }
+
+    #[test]
+    fn repeated_peek_does_not_run_the_stale_scan() {
+        // 只读操作不能触发 stale 重投：in-flight 属于那个消费者。
+        let mut q = MailMessageQueue::new();
+        q.enqueue("t".to_string(), msg("m1"));
+        q.dequeue_for_ack("t", Some(Duration::from_millis(1)));
+
+        std::thread::sleep(Duration::from_millis(25));
+        assert!(q.peek("t", None).is_empty());
+        assert_eq!(q.in_flight_count("t"), 1);
+
+        q.ack("m1");
+        assert_eq!(q.in_flight_count("t"), 0);
+    }
+
+    #[test]
+    fn peek_hands_out_copies_so_the_observer_cannot_reach_the_queue() {
+        // Rust 的 `Clone` 是深拷贝，所以上面那句在 Rust 端是保证，不是 best-effort。
+        let mut q = MailMessageQueue::new();
+        q.enqueue("t".to_string(), TestMessage { id: "m1".to_string() });
+
+        let mut copy = q.peek("t", None).remove(0);
+        copy.id = "should not leak".to_string();
+
+        assert_eq!(q.peek("t", None)[0].id, "m1");
+        assert_eq!(q.dequeue("t").unwrap().id, "m1");
+    }
+
+    #[test]
+    fn has_topic_survives_the_trip_through_in_flight() {
+        let mut q = MailMessageQueue::new();
+        assert!(!q.has_topic("t"));
+
+        q.enqueue("t".to_string(), msg("m1"));
+        assert!(q.has_topic("t"));
+
+        q.dequeue_for_ack("t", Some(Duration::from_secs(30)));
+        assert!(q.has_topic("t")); // 只是离开队列，并未处理完
+
+        q.ack("m1");
+        assert!(!q.has_topic("t"));
+    }
+
+    #[test]
+    fn topics_lists_only_topics_holding_messages_sorted() {
+        let mut q = MailMessageQueue::new();
+        q.enqueue("t2".to_string(), msg("m2"));
+        q.enqueue("t1".to_string(), msg("m1"));
+        q.enqueue("t1".to_string(), msg("m3"));
+        q.enqueue("t0".to_string(), msg("m0"));
+        q.dequeue("t0"); // 空队列不再算「有消息」
+
+        assert_eq!(q.topics(), vec!["t1".to_string(), "t2".to_string()]);
+
+        q.dequeue_for_ack("t1", Some(Duration::from_secs(30)));
+        q.dequeue("t1"); // 队列扇干，但 m1 还在 in-flight
+        assert_eq!(q.topics(), vec!["t1".to_string(), "t2".to_string()]); // in-flight 也算痕迹
+        q.ack("m1");
+        assert_eq!(q.topics(), vec!["t2".to_string()]);
     }
 
     #[test]

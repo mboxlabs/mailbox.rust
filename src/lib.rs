@@ -9,8 +9,17 @@ pub mod utils;
 pub mod providers;
 
 pub use error::MailboxError;
-pub use message::{MailMessage, OutgoingMail, MailboxStatus, FetchOptions};
-pub use provider::{AckableMessage, MailboxProvider, Subscription, SubscriptionStatus};
+pub use message::{
+    FetchOptions, MailMessage, MailboxAddressSnapshot, MailboxSnapshot, MailboxStatus, OutgoingMail,
+};
+pub use provider::{
+    reject_peek_in_fetch, AckableMessage, MailboxProvider, Subscription, SubscriptionStatus,
+    ADDRESS_ENUMERATION_CAPABILITY, PEEK_CAPABILITY,
+};
+pub use utils::{
+    assert_lossless_mailbox_address, copy_for_peek, get_canonical_mailbox_address_identifier,
+    normalize_peek_limit, parse_mailbox_address,
+};
 pub use mailbox::Mailbox;
 pub use core::{
     DeliveryListener, ProviderCore, ProviderCoreOptions, DEFAULT_ATTEMPT_LEDGER_TTL,
