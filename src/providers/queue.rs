@@ -1,7 +1,7 @@
-use std::collections::{HashMap, VecDeque};
-use std::time::{Duration, Instant};
 use crate::message::Identifiable;
 use crate::utils::{copy_for_peek, normalize_peek_limit};
+use std::collections::{HashMap, VecDeque};
+use std::time::{Duration, Instant};
 
 /// 手动 ACK 模式下未指定 `ack_timeout` 时的默认超时。
 ///
@@ -33,7 +33,8 @@ pub struct MailMessageQueue<T> {
 }
 
 impl<T> Default for MailMessageQueue<T>
-where T: Clone + Identifiable
+where
+    T: Clone + Identifiable,
 {
     fn default() -> Self {
         Self::new()
@@ -41,7 +42,8 @@ where T: Clone + Identifiable
 }
 
 impl<T> MailMessageQueue<T>
-where T: Clone + Identifiable
+where
+    T: Clone + Identifiable,
 {
     pub fn new() -> Self {
         Self {
@@ -51,21 +53,14 @@ where T: Clone + Identifiable
     }
 
     pub fn enqueue(&mut self, topic: String, message: T) {
-        self.queues
-            .entry(topic)
-            .or_default()
-            .push_back(message);
+        self.queues.entry(topic).or_default().push_back(message);
     }
 
     pub fn dequeue(&mut self, topic: &str) -> Option<T> {
         self.queues.get_mut(topic)?.pop_front()
     }
 
-    pub fn dequeue_for_ack(
-        &mut self,
-        topic: &str,
-        ack_timeout: Option<Duration>
-    ) -> Option<T> {
+    pub fn dequeue_for_ack(&mut self, topic: &str, ack_timeout: Option<Duration>) -> Option<T> {
         if let Some(timeout) = resolve_ack_timeout(ack_timeout) {
             self.requeue_stale(topic, timeout);
         }
@@ -73,11 +68,14 @@ where T: Clone + Identifiable
         let message = self.queues.get_mut(topic)?.pop_front()?;
         let id = message.id().to_string();
 
-        self.in_flight.insert(id, InFlightMessage {
-            message: message.clone(),
-            timestamp: Instant::now(),
-            topic: topic.to_string(),
-        });
+        self.in_flight.insert(
+            id,
+            InFlightMessage {
+                message: message.clone(),
+                timestamp: Instant::now(),
+                topic: topic.to_string(),
+            },
+        );
 
         Some(message)
     }
@@ -130,7 +128,12 @@ where T: Clone + Identifiable
     /// 这个 topic 在队列里有没有痕迹（等待中的消息或 in-flight）。
     /// 与 [`has`](Self::has)（按消息 id）不同：这是按 topic 的「存不存在」，用于 status 的 `exists`。
     pub fn has_topic(&self, topic: &str) -> bool {
-        if self.queues.get(topic).map(|q| !q.is_empty()).unwrap_or(false) {
+        if self
+            .queues
+            .get(topic)
+            .map(|q| !q.is_empty())
+            .unwrap_or(false)
+        {
             return true;
         }
         self.in_flight.values().any(|flight| flight.topic == topic)
@@ -153,7 +156,10 @@ where T: Clone + Identifiable
 
     /// 已交给消费者、尚未 ack/nack 的消息数。
     pub fn in_flight_count(&self, topic: &str) -> usize {
-        self.in_flight.values().filter(|flight| flight.topic == topic).count()
+        self.in_flight
+            .values()
+            .filter(|flight| flight.topic == topic)
+            .count()
     }
 
     /// 公开入口：把消息放回队列头部。用于订阅者处理失败后的回队。
@@ -177,10 +183,7 @@ where T: Clone + Identifiable
                 return false; // 已在队列里等待，不需要第二份
             }
         }
-        self.queues
-            .entry(topic)
-            .or_default()
-            .push_front(message);
+        self.queues.entry(topic).or_default().push_front(message);
         true
     }
 
@@ -205,8 +208,8 @@ where T: Clone + Identifiable
     /// @returns 被丢弃的消息数（含 in-flight），便于诊断与断言。
     pub fn clear(&mut self, topic: Option<&str>) -> usize {
         let Some(topic) = topic else {
-            let dropped = self.in_flight.len()
-                + self.queues.values().map(|queue| queue.len()).sum::<usize>();
+            let dropped =
+                self.in_flight.len() + self.queues.values().map(|queue| queue.len()).sum::<usize>();
             self.queues.clear();
             self.in_flight.clear();
             return dropped;
@@ -272,7 +275,10 @@ mod tests {
         // 不传 ≠ 永不超时；Some(ZERO) 才是显式关闭。
         assert_eq!(resolve_ack_timeout(None), Some(DEFAULT_ACK_TIMEOUT));
         assert_eq!(resolve_ack_timeout(Some(Duration::ZERO)), None);
-        assert_eq!(resolve_ack_timeout(Some(Duration::from_millis(5))), Some(Duration::from_millis(5)));
+        assert_eq!(
+            resolve_ack_timeout(Some(Duration::from_millis(5))),
+            Some(Duration::from_millis(5))
+        );
     }
 
     #[test]
@@ -280,14 +286,18 @@ mod tests {
         let mut q = MailMessageQueue::new();
         q.enqueue("t".to_string(), msg("m1"));
 
-        let first = q.dequeue_for_ack("t", Some(Duration::from_millis(10))).unwrap();
+        let first = q
+            .dequeue_for_ack("t", Some(Duration::from_millis(10)))
+            .unwrap();
         assert_eq!(first.id, "m1");
         assert_eq!(q.get_status("t"), 0);
         assert_eq!(q.in_flight_count("t"), 1);
 
         std::thread::sleep(Duration::from_millis(25));
 
-        let recovered = q.dequeue_for_ack("t", Some(Duration::from_millis(10))).unwrap();
+        let recovered = q
+            .dequeue_for_ack("t", Some(Duration::from_millis(10)))
+            .unwrap();
         assert_eq!(recovered.id, "m1");
         assert_eq!(q.in_flight_count("t"), 1);
     }
@@ -363,7 +373,10 @@ mod tests {
         q.enqueue("t".to_string(), msg("msg-2"));
 
         let snapshot = q.peek("t", None);
-        assert_eq!(snapshot.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["msg-1", "msg-2"]);
+        assert_eq!(
+            snapshot.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            ["msg-1", "msg-2"]
+        );
 
         // 关键：快照完全不留痕迹。
         assert_eq!(q.get_status("t"), 2);
@@ -390,7 +403,10 @@ mod tests {
 
         assert!(q.peek("t", Some(0)).is_empty());
         assert_eq!(
-            q.peek("t", Some(2)).iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            q.peek("t", Some(2))
+                .iter()
+                .map(|m| m.id.as_str())
+                .collect::<Vec<_>>(),
             ["msg-1", "msg-2"]
         );
         assert_eq!(q.peek("t", Some(usize::MAX)).len(), 3);
@@ -404,13 +420,22 @@ mod tests {
         q.enqueue("t".to_string(), msg("msg-2"));
         q.dequeue_for_ack("t", Some(Duration::from_secs(30)));
 
-        assert_eq!(q.peek("t", None).iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["msg-2"]);
+        assert_eq!(
+            q.peek("t", None)
+                .iter()
+                .map(|m| m.id.as_str())
+                .collect::<Vec<_>>(),
+            ["msg-2"]
+        );
         assert_eq!(q.get_status("t"), 1);
         assert_eq!(q.in_flight_count("t"), 1);
 
         q.nack("msg-1", true);
         assert_eq!(
-            q.peek("t", None).iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            q.peek("t", None)
+                .iter()
+                .map(|m| m.id.as_str())
+                .collect::<Vec<_>>(),
             ["msg-1", "msg-2"]
         );
     }
@@ -434,7 +459,12 @@ mod tests {
     fn peek_hands_out_copies_so_the_observer_cannot_reach_the_queue() {
         // Rust 的 `Clone` 是深拷贝，所以上面那句在 Rust 端是保证，不是 best-effort。
         let mut q = MailMessageQueue::new();
-        q.enqueue("t".to_string(), TestMessage { id: "m1".to_string() });
+        q.enqueue(
+            "t".to_string(),
+            TestMessage {
+                id: "m1".to_string(),
+            },
+        );
 
         let mut copy = q.peek("t", None).remove(0);
         copy.id = "should not leak".to_string();
@@ -482,8 +512,12 @@ mod tests {
         q.enqueue("t".to_string(), msg("m1"));
         q.enqueue("t".to_string(), msg("m2"));
 
-        let a = q.dequeue_for_ack("t", Some(Duration::from_secs(30))).unwrap();
-        let b = q.dequeue_for_ack("t", Some(Duration::from_secs(30))).unwrap();
+        let a = q
+            .dequeue_for_ack("t", Some(Duration::from_secs(30)))
+            .unwrap();
+        let b = q
+            .dequeue_for_ack("t", Some(Duration::from_secs(30)))
+            .unwrap();
         assert_eq!(q.in_flight_count("t"), 2);
 
         q.ack(&a.id);

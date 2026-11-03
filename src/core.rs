@@ -228,7 +228,13 @@ impl ProviderCore {
 
     /// 补上退订实现（`register_subscription` 之后、返回 `Subscription` 之前调用）。
     pub fn attach_unsubscribe(&self, subscription_id: &str, hook: UnsubscribeHook) {
-        if let Some(sub) = self.state.write().unwrap().subscriptions.get_mut(subscription_id) {
+        if let Some(sub) = self
+            .state
+            .write()
+            .unwrap()
+            .subscriptions
+            .get_mut(subscription_id)
+        {
             sub.unsubscribe = Some(hook);
         }
     }
@@ -243,7 +249,11 @@ impl ProviderCore {
 
     /// 某个订阅是否仍活跃。
     pub fn is_subscribed(&self, subscription_id: &str) -> bool {
-        self.state.read().unwrap().subscriptions.contains_key(subscription_id)
+        self.state
+            .read()
+            .unwrap()
+            .subscriptions
+            .contains_key(subscription_id)
     }
 
     /// 订阅地址（退订后为 `None`）。
@@ -260,9 +270,7 @@ impl ProviderCore {
     pub fn build_listener(self: &Arc<Self>, subscription_id: &str) -> DeliveryListener {
         let core = self.clone();
         let subscription_id = subscription_id.to_string();
-        Arc::new(move |message: MailMessage| {
-            core.clone().start_delivery(&subscription_id, message)
-        })
+        Arc::new(move |message: MailMessage| core.clone().start_delivery(&subscription_id, message))
     }
 
     // --- 投递入口 ---
@@ -368,7 +376,10 @@ impl ProviderCore {
                 Ok(()) => {
                     // On successful execution, implicitly acknowledge the message.
                     core.ack(message.clone()).await;
-                    core.attempts.lock().unwrap().reset(&subscription_id, &message.id);
+                    core.attempts
+                        .lock()
+                        .unwrap()
+                        .reset(&subscription_id, &message.id);
                     core.settle_delivery(&key, None);
                 }
                 Err(error) => {
@@ -380,7 +391,14 @@ impl ProviderCore {
     }
 
     /// 退避到期：重投给失败的那个订阅者。
-    fn fire_retry(self: &Arc<Self>, subscription_id: String, message: MailMessage, key: &str, generation: u64, token: u64) {
+    fn fire_retry(
+        self: &Arc<Self>,
+        subscription_id: String,
+        message: MailMessage,
+        key: &str,
+        generation: u64,
+        token: u64,
+    ) {
         {
             let mut state = self.state.write().unwrap();
             let pending = match state.pending.get_mut(key) {
@@ -421,14 +439,21 @@ impl ProviderCore {
         key: &str,
         error: crate::error::MailboxError,
     ) {
-        eprintln!("[{}] Error processing message {}: {}", self.protocol, message.id, error);
+        eprintln!(
+            "[{}] Error processing message {}: {}",
+            self.protocol, message.id, error
+        );
 
         let is_retriable = error.is_retriable();
         let policy = self.retry_policy();
 
         if is_retriable {
             if let Some(policy) = policy {
-                let attempt = self.attempts.lock().unwrap().record(subscription_id, &message.id);
+                let attempt = self
+                    .attempts
+                    .lock()
+                    .unwrap()
+                    .record(subscription_id, &message.id);
 
                 if attempt < policy.max_attempts && self.is_subscribed(subscription_id) {
                     let delay = next_retry_delay(&policy, attempt);
@@ -459,7 +484,10 @@ impl ProviderCore {
                 }
 
                 if attempt >= policy.max_attempts {
-                    self.attempts.lock().unwrap().reset(subscription_id, &message.id);
+                    self.attempts
+                        .lock()
+                        .unwrap()
+                        .reset(subscription_id, &message.id);
                     let hook = self.retry_exhausted.read().unwrap().clone();
                     if let Some(hook) = hook {
                         hook(message.clone(), attempt);
@@ -641,7 +669,13 @@ impl ProviderCore {
 
     /// 这条消息当前有没有正在判定的 barrier（同 id 并发广播时按层数计）。
     fn barrier_depth(&self, message_id: &str) -> u32 {
-        self.state.read().unwrap().barriers.get(message_id).copied().unwrap_or(0)
+        self.state
+            .read()
+            .unwrap()
+            .barriers
+            .get(message_id)
+            .copied()
+            .unwrap_or(0)
     }
 
     ///
@@ -650,7 +684,11 @@ impl ProviderCore {
     /// （“不得静默丢失”），也不能让消息消失；同时告警提示 provider 作者。
     ///
     /// 推迟一个任务 tick 再判定：派发里同步失败的投递跑在发送侧登记 barrier 之前。
-    fn fallback_for_missing_barrier(self: &Arc<Self>, message: MailMessage, result: DeliveryResult) {
+    fn fallback_for_missing_barrier(
+        self: &Arc<Self>,
+        message: MailMessage,
+        result: DeliveryResult,
+    ) {
         if result.ok || self.barrier_depth(&message.id) > 0 {
             return;
         }
@@ -741,7 +779,9 @@ impl ProviderCore {
         let (delivery_id, timeout) = {
             let state = self.state.read().unwrap();
             match state.pending.get(key) {
-                Some(pending) if pending.generation == generation && pending.watchdog_token == token => {
+                Some(pending)
+                    if pending.generation == generation && pending.watchdog_token == token =>
+                {
                     (pending.delivery_id.clone(), self.delivery_settle_timeout())
                 }
                 // 已结算或已进入退避：不是“卡死的尝试”
@@ -764,7 +804,10 @@ impl ProviderCore {
         let protocol = self.protocol.clone();
         Box::pin(async move {
             if let Err(error) = hook(message.clone()).await {
-                eprintln!("[{}] CRITICAL: Failed to ACK message {}. {}", protocol, message.id, error);
+                eprintln!(
+                    "[{}] CRITICAL: Failed to ACK message {}. {}",
+                    protocol, message.id, error
+                );
             }
         })
     }
@@ -802,7 +845,10 @@ impl ProviderCore {
             };
             for (_id, hook) in hooks {
                 if let Err(error) = hook().await {
-                    eprintln!("[{}] Error unsubscribing during close: {}", core.protocol, error);
+                    eprintln!(
+                        "[{}] Error unsubscribing during close: {}",
+                        core.protocol, error
+                    );
                 }
             }
 
@@ -866,7 +912,10 @@ impl Subscription for CoreSubscription {
     async fn unsubscribe(&mut self) -> Result<()> {
         let hook = {
             let mut state = self.core.state.write().unwrap();
-            state.subscriptions.remove(&self.id).and_then(|sub| sub.unsubscribe)
+            state
+                .subscriptions
+                .remove(&self.id)
+                .and_then(|sub| sub.unsubscribe)
         };
         // 先摘订阅，再取消待重投：正在执行的回调不会被替它下结论。
         self.core.cancel_pending_deliveries(&self.id);

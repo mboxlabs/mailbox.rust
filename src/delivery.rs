@@ -77,7 +77,10 @@ impl DeliveryResult {
 
 /// 投递身份。分隔符用 `\0`，避免 id 拼接歧义。
 pub fn delivery_key(subscription_id: &str, message_id: &str) -> String {
-    format!("{}{}{}", subscription_id, DELIVERY_KEY_SEPARATOR, message_id)
+    format!(
+        "{}{}{}",
+        subscription_id, DELIVERY_KEY_SEPARATOR, message_id
+    )
 }
 
 /// 从投递身份里取出 subscription_id。
@@ -123,7 +126,11 @@ pub fn to_delivery_results(settled: Vec<Result<DeliveryResult, ()>>) -> Vec<Deli
 /// 结算结果自洽：成功不带 reason，失败必须带。
 fn normalize(result: DeliveryResult) -> DeliveryResult {
     DeliveryResult {
-        reason: if result.ok { None } else { result.reason.or(Some(FailureReason::Retriable)) },
+        reason: if result.ok {
+            None
+        } else {
+            result.reason.or(Some(FailureReason::Retriable))
+        },
         ..result
     }
 }
@@ -188,9 +195,10 @@ mod tests {
         ]));
 
         // 取消的重投等同可重试
-        assert!(should_requeue_after_broadcast(&[
-            delivery(Some(FailureReason::Cancelled), false)
-        ]));
+        assert!(should_requeue_after_broadcast(&[delivery(
+            Some(FailureReason::Cancelled),
+            false
+        )]));
 
         // 全部不可重试 → 死信，不回队
         assert!(!should_requeue_after_broadcast(&[

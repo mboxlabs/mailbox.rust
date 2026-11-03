@@ -28,7 +28,10 @@ pub enum MailboxError {
     /// 为什么要有这个错误：把 `peek` 这类新选项交给不认识它的 provider，等于**静默退化成普通
     /// fetch** —— 调用方以为自己在只读快照，实际已经把消息出队了。宁可抛错。
     #[error("The '{protocol}' provider does not support '{capability}'.")]
-    UnsupportedCapability { protocol: String, capability: String },
+    UnsupportedCapability {
+        protocol: String,
+        capability: String,
+    },
 
     /// 没有 provider 认领这个协议（对齐 TS `NoProviderError` / Python `ProviderNotFound`）。
     #[error("No provider found for protocol: {0}")]

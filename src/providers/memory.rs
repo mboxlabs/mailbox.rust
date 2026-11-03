@@ -38,7 +38,8 @@ struct BusState {
 ///
 /// 注册表不会自动回收：动态生成的 scope 名（带时间戳、每次新建）会一直占着那份状态。
 /// 需要「用完就丢」的场景用私有总线（[`MemoryEventBus::new`] / [`MemoryProvider::create_isolated`]）。
-static SCOPES: Lazy<RwLock<HashMap<String, MemoryEventBus>>> = Lazy::new(|| RwLock::new(HashMap::new()));
+static SCOPES: Lazy<RwLock<HashMap<String, MemoryEventBus>>> =
+    Lazy::new(|| RwLock::new(HashMap::new()));
 
 /// 模拟消息传递的内存总线（一个「服务端」）：每个实例持有一份 topic 队列 + 订阅表。
 ///
@@ -213,7 +214,11 @@ impl MemoryEventBus {
     ///
     /// 返回广播时每次投递的结算 future（供发送侧做结算判定，见 `_send`）；入队时返回 `None`。
     /// 注意广播仍是 fire-and-forget：这里不等待，`post()` 也不会等订阅回调跑完。
-    fn publish(&self, topic: &str, message: MailMessage) -> Option<Vec<BoxFuture<'static, DeliveryResult>>> {
+    fn publish(
+        &self,
+        topic: &str,
+        message: MailMessage,
+    ) -> Option<Vec<BoxFuture<'static, DeliveryResult>>> {
         // 先 clone 出来再释放对 bus 的借用：监听器（core）会去拿自己的锁，绝不能持着 bus 的锁调它。
         let listeners = {
             let mut bus = self.write();
@@ -234,7 +239,12 @@ impl MemoryEventBus {
         //
         // 每次投递的结算要留一份给发送侧：部分失败时「整条消息回不回队」必须等全部投递结算后
         // 才能判断，不能由先失败的那个订阅者说了算。
-        Some(listeners.iter().map(|listener| listener(message.clone())).collect())
+        Some(
+            listeners
+                .iter()
+                .map(|listener| listener(message.clone()))
+                .collect(),
+        )
     }
 
     /// 订阅失败 / nack 后把消息退回队列头部（去重规则见 [`MailMessageQueue::requeue`]）。
@@ -508,14 +518,18 @@ impl MailboxProvider for MemoryProvider {
 
             return Ok(Some(AckableMessage {
                 message: msg,
-                ack: Box::new(move || Box::pin(async move {
-                    bus_for_ack.ack(&msg_id);
-                    Ok(())
-                })),
-                nack: Box::new(move |requeue| Box::pin(async move {
-                    bus_for_nack.nack(&msg_id_nack, requeue);
-                    Ok(())
-                })),
+                ack: Box::new(move || {
+                    Box::pin(async move {
+                        bus_for_ack.ack(&msg_id);
+                        Ok(())
+                    })
+                }),
+                nack: Box::new(move |requeue| {
+                    Box::pin(async move {
+                        bus_for_nack.nack(&msg_id_nack, requeue);
+                        Ok(())
+                    })
+                }),
             }));
         }
 
@@ -585,12 +599,12 @@ impl MailboxProvider for MemoryProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Mailbox;
     use crate::core::ProviderCore;
     use crate::delivery::FailureReason;
     use crate::error::MailboxError;
     use crate::message::OutgoingMail;
     use crate::provider::SubscriptionStatus;
+    use crate::Mailbox;
     use serde_json::{json, Value};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
@@ -607,14 +621,19 @@ mod tests {
     }
 
     async fn post_once(provider: &MemoryProvider, to: &Url, id: &str) -> Result<()> {
-        provider.send(OutgoingMail {
-            id: Some(id.to_string()),
-            from: "mem:rust-bus/sender".parse()?,
-            to: to.clone(),
-            body: json!("content"),
-            headers: HashMap::new(),
-            meta: HashMap::new(),
-        }.into()).await?;
+        provider
+            .send(
+                OutgoingMail {
+                    id: Some(id.to_string()),
+                    from: "mem:rust-bus/sender".parse()?,
+                    to: to.clone(),
+                    body: json!("content"),
+                    headers: HashMap::new(),
+                    meta: HashMap::new(),
+                }
+                .into(),
+            )
+            .await?;
         Ok(())
     }
 
@@ -626,15 +645,20 @@ mod tests {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let tx = Arc::new(Mutex::new(Some(tx)));
 
-        let _sub = provider.subscribe(address.clone(), Box::new(move |msg| {
-            let tx = tx.clone();
-            Box::pin(async move {
-                if let Some(tx) = tx.lock().unwrap().take() {
-                    tx.send(msg).unwrap();
-                }
-                Ok(())
-            })
-        })).await?;
+        let _sub = provider
+            .subscribe(
+                address.clone(),
+                Box::new(move |msg| {
+                    let tx = tx.clone();
+                    Box::pin(async move {
+                        if let Some(tx) = tx.lock().unwrap().take() {
+                            tx.send(msg).unwrap();
+                        }
+                        Ok(())
+                    })
+                }),
+            )
+            .await?;
 
         let mail = OutgoingMail {
             id: None,
@@ -690,7 +714,9 @@ mod tests {
 
         provider.send(mail.into()).await?;
 
-        let fetched = provider.fetch(address.clone(), FetchOptions::default()).await?;
+        let fetched = provider
+            .fetch(address.clone(), FetchOptions::default())
+            .await?;
         assert!(fetched.is_some());
         let msg = fetched.unwrap();
         assert_eq!(msg.message.id, "msg1");
@@ -790,15 +816,18 @@ mod tests {
         let tx = Arc::new(Mutex::new(Some(tx)));
 
         let _sub = provider
-            .subscribe(address.clone(), Box::new(move |msg| {
-                let tx = tx.clone();
-                Box::pin(async move {
-                    if let Some(tx) = tx.lock().unwrap().take() {
-                        tx.send(msg).unwrap();
-                    }
-                    Ok(())
-                })
-            }))
+            .subscribe(
+                address.clone(),
+                Box::new(move |msg| {
+                    let tx = tx.clone();
+                    Box::pin(async move {
+                        if let Some(tx) = tx.lock().unwrap().take() {
+                            tx.send(msg).unwrap();
+                        }
+                        Ok(())
+                    })
+                }),
+            )
             .await?;
 
         let mail = OutgoingMail {
@@ -817,7 +846,10 @@ mod tests {
         // 旧行为：投递给监听器的同时又入队 → unread_count 永久增长
         let status = provider.status(address.clone()).await?;
         assert_eq!(status.unread_count, Some(0));
-        assert!(provider.fetch(address, FetchOptions::default()).await?.is_none());
+        assert!(provider
+            .fetch(address, FetchOptions::default())
+            .await?
+            .is_none());
         Ok(())
     }
 
@@ -868,7 +900,11 @@ mod tests {
         assert_eq!(initial.unread_count, Some(1));
         assert_eq!(initial.in_flight_count, Some(0));
 
-        let options = FetchOptions { manual_ack: true, ack_timeout: Some(5000), ..Default::default() };
+        let options = FetchOptions {
+            manual_ack: true,
+            ack_timeout: Some(5000),
+            ..Default::default()
+        };
         let fetched = provider.fetch(address.clone(), options).await?.unwrap();
 
         // 旧行为：in-flight 消息在状态里完全隐形
@@ -898,9 +934,19 @@ mod tests {
         provider.send(mail.into()).await?;
 
         // 消费者“崩溃”：取走后不 ack
-        let options = FetchOptions { manual_ack: true, ack_timeout: Some(20), ..Default::default() };
-        assert!(provider.fetch(address.clone(), options.clone()).await?.is_some());
-        assert!(provider.fetch(address.clone(), options.clone()).await?.is_none());
+        let options = FetchOptions {
+            manual_ack: true,
+            ack_timeout: Some(20),
+            ..Default::default()
+        };
+        assert!(provider
+            .fetch(address.clone(), options.clone())
+            .await?
+            .is_some());
+        assert!(provider
+            .fetch(address.clone(), options.clone())
+            .await?
+            .is_none());
 
         tokio::time::sleep(Duration::from_millis(40)).await;
 
@@ -917,20 +963,32 @@ mod tests {
         let address: Url = "mem:rust-bus/sub-retriable".parse()?;
 
         let _sub = provider
-            .subscribe(address.clone(), Box::new(|_| Box::pin(async {
-                Err(MailboxError::Retriable("upstream unavailable".to_string()))
-            })))
+            .subscribe(
+                address.clone(),
+                Box::new(|_| {
+                    Box::pin(async {
+                        Err(MailboxError::Retriable("upstream unavailable".to_string()))
+                    })
+                }),
+            )
             .await?;
 
         post_once(&provider, &address, "retry1").await?;
 
         // 旧行为：回调返回 () ，错误无人处理 → 消息既不入队也不回队，静默消失。
         let requeued = wait_until(|| async {
-            provider.status(address.clone()).await.map(|s| s.unread_count == Some(1)).unwrap_or(false)
-        }).await;
+            provider
+                .status(address.clone())
+                .await
+                .map(|s| s.unread_count == Some(1))
+                .unwrap_or(false)
+        })
+        .await;
         assert!(requeued, "可重试失败后消息应退回队列");
 
-        let fetched = provider.fetch(address.clone(), FetchOptions::default()).await?;
+        let fetched = provider
+            .fetch(address.clone(), FetchOptions::default())
+            .await?;
         assert!(fetched.is_some(), "退回的消息应可被 fetch 取回");
         assert_eq!(fetched.unwrap().message.id, "retry1");
         Ok(())
@@ -942,20 +1000,30 @@ mod tests {
         let address: Url = "mem:rust-bus/sub-transport".parse()?;
 
         let _sub = provider
-            .subscribe(address.clone(), Box::new(|_| Box::pin(async {
-                Err(MailboxError::Transport {
-                    code: "ETIMEDOUT".to_string(),
-                    message: "connection reset by peer".to_string(),
-                })
-            })))
+            .subscribe(
+                address.clone(),
+                Box::new(|_| {
+                    Box::pin(async {
+                        Err(MailboxError::Transport {
+                            code: "ETIMEDOUT".to_string(),
+                            message: "connection reset by peer".to_string(),
+                        })
+                    })
+                }),
+            )
             .await?;
 
         post_once(&provider, &address, "retry2").await?;
 
         // 错误码命中重试白名单（与 TS / Python 一致），同样应回队。
         let requeued = wait_until(|| async {
-            provider.status(address.clone()).await.map(|s| s.unread_count == Some(1)).unwrap_or(false)
-        }).await;
+            provider
+                .status(address.clone())
+                .await
+                .map(|s| s.unread_count == Some(1))
+                .unwrap_or(false)
+        })
+        .await;
         assert!(requeued, "传输层错误码命中白名单时应退回队列");
         Ok(())
     }
@@ -969,15 +1037,18 @@ mod tests {
         let tx = Arc::new(Mutex::new(Some(tx)));
 
         let _sub = provider
-            .subscribe(address.clone(), Box::new(move |_| {
-                let tx = tx.clone();
-                Box::pin(async move {
-                    if let Some(tx) = tx.lock().unwrap().take() {
-                        let _ = tx.send(());
-                    }
-                    Err(MailboxError::InvalidAddress("bad payload".to_string()))
-                })
-            }))
+            .subscribe(
+                address.clone(),
+                Box::new(move |_| {
+                    let tx = tx.clone();
+                    Box::pin(async move {
+                        if let Some(tx) = tx.lock().unwrap().take() {
+                            let _ = tx.send(());
+                        }
+                        Err(MailboxError::InvalidAddress("bad payload".to_string()))
+                    })
+                }),
+            )
             .await?;
 
         post_once(&provider, &address, "dead1").await?;
@@ -987,7 +1058,10 @@ mod tests {
         // 不可重试 → 按死信丢弃，避免同一条坏消息被无限重试。
         let status = provider.status(address.clone()).await?;
         assert_eq!(status.unread_count, Some(0));
-        assert!(provider.fetch(address, FetchOptions::default()).await?.is_none());
+        assert!(provider
+            .fetch(address, FetchOptions::default())
+            .await?
+            .is_none());
         Ok(())
     }
 
@@ -1002,55 +1076,80 @@ mod tests {
         let provider = MemoryProvider::new();
         let address: Url = "mem:rust-bus/dedup-multi-sub".parse()?;
 
-        let _s1 = provider.subscribe(address.clone(), failing_handler()).await?;
-        let _s2 = provider.subscribe(address.clone(), failing_handler()).await?;
+        let _s1 = provider
+            .subscribe(address.clone(), failing_handler())
+            .await?;
+        let _s2 = provider
+            .subscribe(address.clone(), failing_handler())
+            .await?;
 
         post_once(&provider, &address, "dup1").await?;
 
         // 旧行为：每个失败的订阅者各回队一份 → unread_count 为 2，同一条消息被 fetch 两次
         let settled = wait_until(|| async {
-            provider.status(address.clone()).await.map(|s| s.unread_count >= Some(1)).unwrap_or(false)
-        }).await;
+            provider
+                .status(address.clone())
+                .await
+                .map(|s| s.unread_count >= Some(1))
+                .unwrap_or(false)
+        })
+        .await;
         assert!(settled);
 
         let status = provider.status(address.clone()).await?;
         assert_eq!(status.unread_count, Some(1), "队列里只应留一份副本");
 
-        let fetched = provider.fetch(address.clone(), FetchOptions::default()).await?;
+        let fetched = provider
+            .fetch(address.clone(), FetchOptions::default())
+            .await?;
         assert!(fetched.is_some());
         assert_eq!(fetched.unwrap().message.id, "dup1");
-        assert!(provider.fetch(address, FetchOptions::default()).await?.is_none());
+        assert!(provider
+            .fetch(address, FetchOptions::default())
+            .await?
+            .is_none());
         Ok(())
     }
 
     #[tokio::test]
     async fn test_retry_targets_only_the_failing_subscriber() -> Result<()> {
-        let provider = MemoryProvider::with_retry(Some(RetryPolicy::new(3, Duration::from_millis(5))));
+        let provider =
+            MemoryProvider::with_retry(Some(RetryPolicy::new(3, Duration::from_millis(5))));
         let address: Url = "mem:rust-bus/retry-targeted".parse()?;
 
         let healthy = Arc::new(AtomicUsize::new(0));
         let flaky = Arc::new(AtomicUsize::new(0));
 
         let h = healthy.clone();
-        let _s1 = provider.subscribe(address.clone(), Box::new(move |_| {
-            let h = h.clone();
-            Box::pin(async move {
-                h.fetch_add(1, Ordering::SeqCst);
-                Ok(())
-            })
-        })).await?;
+        let _s1 = provider
+            .subscribe(
+                address.clone(),
+                Box::new(move |_| {
+                    let h = h.clone();
+                    Box::pin(async move {
+                        h.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    })
+                }),
+            )
+            .await?;
 
         let f = flaky.clone();
-        let _s2 = provider.subscribe(address.clone(), Box::new(move |_| {
-            let f = f.clone();
-            Box::pin(async move {
-                let attempt = f.fetch_add(1, Ordering::SeqCst) + 1;
-                if attempt < 3 {
-                    return Err(MailboxError::Retriable("outage".to_string()));
-                }
-                Ok(())
-            })
-        })).await?;
+        let _s2 = provider
+            .subscribe(
+                address.clone(),
+                Box::new(move |_| {
+                    let f = f.clone();
+                    Box::pin(async move {
+                        let attempt = f.fetch_add(1, Ordering::SeqCst) + 1;
+                        if attempt < 3 {
+                            return Err(MailboxError::Retriable("outage".to_string()));
+                        }
+                        Ok(())
+                    })
+                }),
+            )
+            .await?;
 
         post_once(&provider, &address, "targeted1").await?;
 
@@ -1067,18 +1166,24 @@ mod tests {
 
     #[tokio::test]
     async fn test_retry_exhausted_falls_back_to_queue() -> Result<()> {
-        let provider = MemoryProvider::with_retry(Some(RetryPolicy::new(2, Duration::from_millis(5))));
+        let provider =
+            MemoryProvider::with_retry(Some(RetryPolicy::new(2, Duration::from_millis(5))));
         let address: Url = "mem:rust-bus/retry-exhausted".parse()?;
 
         let calls = Arc::new(AtomicUsize::new(0));
         let c = calls.clone();
-        let _sub = provider.subscribe(address.clone(), Box::new(move |_| {
-            let c = c.clone();
-            Box::pin(async move {
-                c.fetch_add(1, Ordering::SeqCst);
-                Err(MailboxError::Retriable("outage".to_string()))
-            })
-        })).await?;
+        let _sub = provider
+            .subscribe(
+                address.clone(),
+                Box::new(move |_| {
+                    let c = c.clone();
+                    Box::pin(async move {
+                        c.fetch_add(1, Ordering::SeqCst);
+                        Err(MailboxError::Retriable("outage".to_string()))
+                    })
+                }),
+            )
+            .await?;
 
         post_once(&provider, &address, "exhausted1").await?;
 
@@ -1087,28 +1192,42 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(60)).await;
 
         assert_eq!(calls.load(Ordering::SeqCst), 2, "不应超过 max_attempts");
-        assert_eq!(provider.status(address.clone()).await?.unread_count, Some(1));
+        assert_eq!(
+            provider.status(address.clone()).await?.unread_count,
+            Some(1)
+        );
 
         let fetched = provider.fetch(address, FetchOptions::default()).await?;
-        assert!(fetched.is_some(), "重试耗尽后消息应退回队列，交给 fetch 兜底");
+        assert!(
+            fetched.is_some(),
+            "重试耗尽后消息应退回队列，交给 fetch 兜底"
+        );
         assert_eq!(fetched.unwrap().message.id, "exhausted1");
         Ok(())
     }
 
     #[tokio::test]
     async fn test_retry_does_not_retry_non_retriable_error() -> Result<()> {
-        let provider = MemoryProvider::with_retry(Some(RetryPolicy::new(3, Duration::from_millis(5))));
+        let provider =
+            MemoryProvider::with_retry(Some(RetryPolicy::new(3, Duration::from_millis(5))));
         let address: Url = "mem:rust-bus/retry-fatal".parse()?;
 
         let calls = Arc::new(AtomicUsize::new(0));
         let c = calls.clone();
-        let _sub = provider.subscribe(address.clone(), Box::new(move |_| {
-            let c = c.clone();
-            Box::pin(async move {
-                c.fetch_add(1, Ordering::SeqCst);
-                Err(MailboxError::InvalidAddress("malformed payload".to_string()))
-            })
-        })).await?;
+        let _sub = provider
+            .subscribe(
+                address.clone(),
+                Box::new(move |_| {
+                    let c = c.clone();
+                    Box::pin(async move {
+                        c.fetch_add(1, Ordering::SeqCst);
+                        Err(MailboxError::InvalidAddress(
+                            "malformed payload".to_string(),
+                        ))
+                    })
+                }),
+            )
+            .await?;
 
         post_once(&provider, &address, "fatal1").await?;
 
@@ -1123,18 +1242,24 @@ mod tests {
 
     #[tokio::test]
     async fn test_unsubscribe_during_pending_retry_returns_message_to_queue() -> Result<()> {
-        let provider = MemoryProvider::with_retry(Some(RetryPolicy::new(5, Duration::from_millis(50))));
+        let provider =
+            MemoryProvider::with_retry(Some(RetryPolicy::new(5, Duration::from_millis(50))));
         let address: Url = "mem:rust-bus/retry-unsubscribed".parse()?;
 
         let calls = Arc::new(AtomicUsize::new(0));
         let c = calls.clone();
-        let mut sub = provider.subscribe(address.clone(), Box::new(move |_| {
-            let c = c.clone();
-            Box::pin(async move {
-                c.fetch_add(1, Ordering::SeqCst);
-                Err(MailboxError::Retriable("outage".to_string()))
-            })
-        })).await?;
+        let mut sub = provider
+            .subscribe(
+                address.clone(),
+                Box::new(move |_| {
+                    let c = c.clone();
+                    Box::pin(async move {
+                        c.fetch_add(1, Ordering::SeqCst);
+                        Err(MailboxError::Retriable("outage".to_string()))
+                    })
+                }),
+            )
+            .await?;
 
         post_once(&provider, &address, "pending1").await?;
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1143,7 +1268,10 @@ mod tests {
 
         assert_eq!(calls.load(Ordering::SeqCst), 1, "退订后不应再调回调");
         // 重投被取消，但消息不能静默消失
-        assert_eq!(provider.status(address.clone()).await?.unread_count, Some(1));
+        assert_eq!(
+            provider.status(address.clone()).await?.unread_count,
+            Some(1)
+        );
 
         let fetched = provider.fetch(address, FetchOptions::default()).await?;
         assert!(fetched.is_some());
@@ -1218,8 +1346,12 @@ mod tests {
         provider.set_dead_letter_hook(Some(dead.hook()));
 
         let ok_calls = counter();
-        let _ok = provider.subscribe(address.clone(), counting_ok(&ok_calls)).await?;
-        let _bad = provider.subscribe(address.clone(), failing_handler()).await?;
+        let _ok = provider
+            .subscribe(address.clone(), counting_ok(&ok_calls))
+            .await?;
+        let _bad = provider
+            .subscribe(address.clone(), failing_handler())
+            .await?;
 
         post_once(&provider, &address, "partial1").await?;
 
@@ -1229,8 +1361,14 @@ mod tests {
             "不回队的失败投递应能在死信钩子里看到"
         );
         assert_eq!(ok_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(provider.status(address.clone()).await?.unread_count, Some(0));
-        assert!(provider.fetch(address, FetchOptions::default()).await?.is_none());
+        assert_eq!(
+            provider.status(address.clone()).await?.unread_count,
+            Some(0)
+        );
+        assert!(provider
+            .fetch(address, FetchOptions::default())
+            .await?
+            .is_none());
         Ok(())
     }
 
@@ -1242,8 +1380,12 @@ mod tests {
         let dead = DeadLetters::default();
         provider.set_dead_letter_hook(Some(dead.hook()));
 
-        let ok_sub = provider.subscribe(address.clone(), counting_ok(&counter())).await?;
-        let bad_sub = provider.subscribe(address.clone(), failing_handler()).await?;
+        let ok_sub = provider
+            .subscribe(address.clone(), counting_ok(&counter()))
+            .await?;
+        let bad_sub = provider
+            .subscribe(address.clone(), failing_handler())
+            .await?;
 
         post_once(&provider, &address, "dl1").await?;
         assert!(wait_until(|| async { dead.len() >= 1 }).await);
@@ -1268,12 +1410,17 @@ mod tests {
         let _ok = provider
             .subscribe(address.clone(), counting_ok(&side_effects))
             .await?;
-        let _bad = provider.subscribe(address.clone(), failing_handler()).await?;
+        let _bad = provider
+            .subscribe(address.clone(), failing_handler())
+            .await?;
 
         post_once(&provider, &address, "mixed1").await?;
 
         // 轮询消费者：拿不到已广播过的消息，因此不会重跑副作用
-        assert!(provider.fetch(address.clone(), FetchOptions::default()).await?.is_none());
+        assert!(provider
+            .fetch(address.clone(), FetchOptions::default())
+            .await?
+            .is_none());
         assert!(wait_until(|| async { provider.pending_delivery_count() == 0 }).await);
         assert_eq!(side_effects.load(Ordering::SeqCst), 1);
         Ok(())
@@ -1286,18 +1433,33 @@ mod tests {
         let address = addr("mixed-fatal-retriable");
 
         let _fatal = provider
-            .subscribe(address.clone(), Box::new(|_| Box::pin(async {
-                Err(MailboxError::InvalidAddress("malformed payload".to_string()))
-            })))
+            .subscribe(
+                address.clone(),
+                Box::new(|_| {
+                    Box::pin(async {
+                        Err(MailboxError::InvalidAddress(
+                            "malformed payload".to_string(),
+                        ))
+                    })
+                }),
+            )
             .await?;
-        let _retriable = provider.subscribe(address.clone(), failing_handler()).await?;
+        let _retriable = provider
+            .subscribe(address.clone(), failing_handler())
+            .await?;
 
         post_once(&provider, &address, "mixed2").await?;
 
-        assert!(wait_until(|| async {
-            provider.status(address.clone()).await.map(|s| s.unread_count == Some(1)).unwrap_or(false)
-        })
-        .await);
+        assert!(
+            wait_until(|| async {
+                provider
+                    .status(address.clone())
+                    .await
+                    .map(|s| s.unread_count == Some(1))
+                    .unwrap_or(false)
+            })
+            .await
+        );
         let fetched = provider.fetch(address, FetchOptions::default()).await?;
         assert_eq!(fetched.unwrap().message.id, "mixed2");
         Ok(())
@@ -1306,7 +1468,8 @@ mod tests {
     /// [语义] 重试耗尽也不把已成功者处理过的消息退回队列（只有失败者被重投）
     #[tokio::test]
     async fn test_retry_exhausted_with_partial_success_does_not_requeue() -> Result<()> {
-        let provider = MemoryProvider::with_retry(Some(RetryPolicy::new(3, Duration::from_millis(1))));
+        let provider =
+            MemoryProvider::with_retry(Some(RetryPolicy::new(3, Duration::from_millis(1))));
         let address = addr("exhaust-partial");
         let dead = DeadLetters::default();
         provider.set_dead_letter_hook(Some(dead.hook()));
@@ -1314,21 +1477,30 @@ mod tests {
         let ok_calls = counter();
         let bad_calls = counter();
         let bad_for_cb = bad_calls.clone();
-        let _ok = provider.subscribe(address.clone(), counting_ok(&ok_calls)).await?;
+        let _ok = provider
+            .subscribe(address.clone(), counting_ok(&ok_calls))
+            .await?;
         let _bad = provider
-            .subscribe(address.clone(), Box::new(move |_| {
-                let bad_calls = bad_for_cb.clone();
-                Box::pin(async move {
-                    bad_calls.fetch_add(1, Ordering::SeqCst);
-                    Err(MailboxError::Retriable("outage".to_string()))
-                })
-            }))
+            .subscribe(
+                address.clone(),
+                Box::new(move |_| {
+                    let bad_calls = bad_for_cb.clone();
+                    Box::pin(async move {
+                        bad_calls.fetch_add(1, Ordering::SeqCst);
+                        Err(MailboxError::Retriable("outage".to_string()))
+                    })
+                }),
+            )
             .await?;
 
         post_once(&provider, &address, "exhaust2").await?;
 
         assert!(wait_until(|| async { dead.len() >= 1 }).await);
-        assert_eq!(ok_calls.load(Ordering::SeqCst), 1, "已成功者不得被重试广播再跑一次");
+        assert_eq!(
+            ok_calls.load(Ordering::SeqCst),
+            1,
+            "已成功者不得被重试广播再跑一次"
+        );
         assert_eq!(bad_calls.load(Ordering::SeqCst), 3);
         assert_eq!(provider.status(address).await?.unread_count, Some(0));
         Ok(())
@@ -1336,13 +1508,19 @@ mod tests {
 
     /// [语义] 唯一的失败订阅者在待重投期间退订 → 有成功者时不回队
     #[tokio::test]
-    async fn test_cancelling_the_only_failing_subscriber_keeps_message_out_of_queue() -> Result<()> {
-        let provider = MemoryProvider::with_retry(Some(RetryPolicy::new(3, Duration::from_millis(500))));
+    async fn test_cancelling_the_only_failing_subscriber_keeps_message_out_of_queue() -> Result<()>
+    {
+        let provider =
+            MemoryProvider::with_retry(Some(RetryPolicy::new(3, Duration::from_millis(500))));
         let address = addr("cancel-partial");
 
         let ok_calls = counter();
-        let _ok = provider.subscribe(address.clone(), counting_ok(&ok_calls)).await?;
-        let mut bad_sub = provider.subscribe(address.clone(), failing_handler()).await?;
+        let _ok = provider
+            .subscribe(address.clone(), counting_ok(&ok_calls))
+            .await?;
+        let mut bad_sub = provider
+            .subscribe(address.clone(), failing_handler())
+            .await?;
 
         post_once(&provider, &address, "cancel1").await?;
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1363,23 +1541,31 @@ mod tests {
 
         let slow = settled.clone();
         let _slow = provider
-            .subscribe(address.clone(), Box::new(move |_| {
-                let slow = slow.clone();
-                Box::pin(async move {
-                    tokio::time::sleep(Duration::from_millis(60)).await;
-                    slow.fetch_add(1, Ordering::SeqCst);
-                    Ok(())
-                })
-            }))
+            .subscribe(
+                address.clone(),
+                Box::new(move |_| {
+                    let slow = slow.clone();
+                    Box::pin(async move {
+                        tokio::time::sleep(Duration::from_millis(60)).await;
+                        slow.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    })
+                }),
+            )
             .await?;
-        let _fast = provider.subscribe(address.clone(), failing_handler()).await?;
+        let _fast = provider
+            .subscribe(address.clone(), failing_handler())
+            .await?;
 
         post_once(&provider, &address, "slow1").await?;
         tokio::time::sleep(Duration::from_millis(20)).await;
 
         // 旧行为：先失败的订阅者立刻回队 —— 而成功与否此刻还没发生
         assert_eq!(settled.load(Ordering::SeqCst), 0);
-        assert_eq!(provider.status(address.clone()).await?.unread_count, Some(0));
+        assert_eq!(
+            provider.status(address.clone()).await?.unread_count,
+            Some(0)
+        );
 
         assert!(wait_until(|| async { settled.load(Ordering::SeqCst) == 1 }).await);
         assert_eq!(provider.status(address).await?.unread_count, Some(0));
@@ -1395,14 +1581,17 @@ mod tests {
 
         let slow = settled.clone();
         let _sub = provider
-            .subscribe(address.clone(), Box::new(move |_| {
-                let slow = slow.clone();
-                Box::pin(async move {
-                    tokio::time::sleep(Duration::from_millis(30)).await;
-                    slow.fetch_add(1, Ordering::SeqCst);
-                    Ok(())
-                })
-            }))
+            .subscribe(
+                address.clone(),
+                Box::new(move |_| {
+                    let slow = slow.clone();
+                    Box::pin(async move {
+                        tokio::time::sleep(Duration::from_millis(30)).await;
+                        slow.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    })
+                }),
+            )
             .await?;
 
         post_once(&provider, &address, "not-awaiting").await?;
@@ -1421,14 +1610,17 @@ mod tests {
 
         let slow = side_effects.clone();
         let mut sub = provider
-            .subscribe(address.clone(), Box::new(move |_| {
-                let slow = slow.clone();
-                Box::pin(async move {
-                    tokio::time::sleep(Duration::from_millis(40)).await;
-                    slow.fetch_add(1, Ordering::SeqCst);
-                    Ok(())
-                })
-            }))
+            .subscribe(
+                address.clone(),
+                Box::new(move |_| {
+                    let slow = slow.clone();
+                    Box::pin(async move {
+                        tokio::time::sleep(Duration::from_millis(40)).await;
+                        slow.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    })
+                }),
+            )
             .await?;
 
         post_once(&provider, &address, "inflight1").await?;
@@ -1438,8 +1630,14 @@ mod tests {
         assert!(wait_until(|| async { provider.pending_delivery_count() == 0 }).await);
         tokio::time::sleep(Duration::from_millis(60)).await;
         assert_eq!(side_effects.load(Ordering::SeqCst), 1);
-        assert_eq!(provider.status(address.clone()).await?.unread_count, Some(0));
-        assert!(provider.fetch(address, FetchOptions::default()).await?.is_none());
+        assert_eq!(
+            provider.status(address.clone()).await?.unread_count,
+            Some(0)
+        );
+        assert!(provider
+            .fetch(address, FetchOptions::default())
+            .await?
+            .is_none());
         Ok(())
     }
 
@@ -1450,20 +1648,31 @@ mod tests {
         let address = addr("unsubscribe-inflight-fail");
 
         let mut sub = provider
-            .subscribe(address.clone(), Box::new(|_| Box::pin(async move {
-                tokio::time::sleep(Duration::from_millis(30)).await;
-                Err(MailboxError::Retriable("upstream down".to_string()))
-            })))
+            .subscribe(
+                address.clone(),
+                Box::new(|_| {
+                    Box::pin(async move {
+                        tokio::time::sleep(Duration::from_millis(30)).await;
+                        Err(MailboxError::Retriable("upstream down".to_string()))
+                    })
+                }),
+            )
             .await?;
 
         post_once(&provider, &address, "inflight2").await?;
         tokio::time::sleep(Duration::from_millis(10)).await;
         sub.unsubscribe().await?; // 回调还在跑，随后才抛错：没有任何订阅者成功 → 交给 fetch()
 
-        assert!(wait_until(|| async {
-            provider.status(address.clone()).await.map(|s| s.unread_count == Some(1)).unwrap_or(false)
-        })
-        .await);
+        assert!(
+            wait_until(|| async {
+                provider
+                    .status(address.clone())
+                    .await
+                    .map(|s| s.unread_count == Some(1))
+                    .unwrap_or(false)
+            })
+            .await
+        );
         let fetched = provider.fetch(address, FetchOptions::default()).await?;
         assert_eq!(fetched.unwrap().message.id, "inflight2");
         Ok(())
@@ -1472,21 +1681,34 @@ mod tests {
     /// [语义] 退订仍会取消「等待重投」的投递：退避中的投递按取消结算并回队
     #[tokio::test]
     async fn test_unsubscribe_during_backoff_settles_the_delivery() -> Result<()> {
-        let provider = MemoryProvider::with_retry(Some(RetryPolicy::new(5, Duration::from_millis(500))));
+        let provider =
+            MemoryProvider::with_retry(Some(RetryPolicy::new(5, Duration::from_millis(500))));
         let address = addr("unsubscribe-during-backoff");
 
-        let mut sub = provider.subscribe(address.clone(), failing_handler()).await?;
+        let mut sub = provider
+            .subscribe(address.clone(), failing_handler())
+            .await?;
         post_once(&provider, &address, "backoff1").await?;
 
         tokio::time::sleep(Duration::from_millis(10)).await;
         assert_eq!(provider.pending_delivery_count(), 1, "退避中的投递仍未结算");
         sub.unsubscribe().await?;
 
-        assert!(wait_until(|| async { provider.pending_delivery_count() == 0 }).await, "退避定时器已取消并结算");
-        assert!(wait_until(|| async {
-            provider.status(address.clone()).await.map(|s| s.unread_count == Some(1)).unwrap_or(false)
-        })
-        .await, "取消的重投必须退回队列");
+        assert!(
+            wait_until(|| async { provider.pending_delivery_count() == 0 }).await,
+            "退避定时器已取消并结算"
+        );
+        assert!(
+            wait_until(|| async {
+                provider
+                    .status(address.clone())
+                    .await
+                    .map(|s| s.unread_count == Some(1))
+                    .unwrap_or(false)
+            })
+            .await,
+            "取消的重投必须退回队列"
+        );
         let fetched = provider.fetch(address, FetchOptions::default()).await?;
         assert_eq!(fetched.unwrap().message.id, "backoff1");
         Ok(())
@@ -1503,20 +1725,30 @@ mod tests {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let seen_for_cb = seen.clone();
         let _sub = provider
-            .subscribe(address.clone(), Box::new(move |message| {
-                let seen = seen_for_cb.clone();
-                Box::pin(async move {
-                    seen.lock().unwrap().push(message.body["n"].as_u64().unwrap());
-                    tokio::time::sleep(Duration::from_millis(30)).await;
-                    Err(MailboxError::InvalidAddress("malformed payload".to_string()))
-                })
-            }))
+            .subscribe(
+                address.clone(),
+                Box::new(move |message| {
+                    let seen = seen_for_cb.clone();
+                    Box::pin(async move {
+                        seen.lock()
+                            .unwrap()
+                            .push(message.body["n"].as_u64().unwrap());
+                        tokio::time::sleep(Duration::from_millis(30)).await;
+                        Err(MailboxError::InvalidAddress(
+                            "malformed payload".to_string(),
+                        ))
+                    })
+                }),
+            )
             .await?;
 
         post_twice_with_same_id(&provider, &address, "dup-1").await?;
 
         // 修复前：两条投递共用记账键，只有一条 barrier 能跑到死信钩子
-        assert!(wait_until(|| async { dead.len() >= 2 }).await, "两条投递各自结算，各自的 barrier 都跑完");
+        assert!(
+            wait_until(|| async { dead.len() >= 2 }).await,
+            "两条投递各自结算，各自的 barrier 都跑完"
+        );
         assert_eq!(provider.pending_delivery_count(), 0);
         assert_eq!(*seen.lock().unwrap(), vec![1, 2]);
         let mut ids: Vec<String> = (0..2).map(|i| dead.take(i).0.id).collect();
@@ -1535,23 +1767,36 @@ mod tests {
 
         let c = calls.clone();
         let _sub = provider
-            .subscribe(address.clone(), Box::new(move |_| {
-                let c = c.clone();
-                Box::pin(async move {
-                    c.fetch_add(1, Ordering::SeqCst);
-                    tokio::time::sleep(Duration::from_millis(20)).await;
-                    Err(MailboxError::Retriable("upstream down".to_string()))
-                })
-            }))
+            .subscribe(
+                address.clone(),
+                Box::new(move |_| {
+                    let c = c.clone();
+                    Box::pin(async move {
+                        c.fetch_add(1, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                        Err(MailboxError::Retriable("upstream down".to_string()))
+                    })
+                }),
+            )
             .await?;
 
         post_twice_with_same_id(&provider, &address, "dup-2").await?;
 
         assert!(wait_until(|| async { calls.load(Ordering::SeqCst) >= 2 }).await);
         assert!(wait_until(|| async { provider.pending_delivery_count() == 0 }).await);
-        assert_eq!(provider.status(address.clone()).await?.unread_count, Some(1), "never queued twice");
-        assert!(provider.fetch(address.clone(), FetchOptions::default()).await?.is_some());
-        assert!(provider.fetch(address, FetchOptions::default()).await?.is_none());
+        assert_eq!(
+            provider.status(address.clone()).await?.unread_count,
+            Some(1),
+            "never queued twice"
+        );
+        assert!(provider
+            .fetch(address.clone(), FetchOptions::default())
+            .await?
+            .is_some());
+        assert!(provider
+            .fetch(address, FetchOptions::default())
+            .await?
+            .is_none());
         Ok(())
     }
 
@@ -1574,10 +1819,12 @@ mod tests {
     // --- 结算看门狗：卡死的回调必须有界 ---
 
     fn hung_handler() -> SubscriptionHandler {
-        Box::new(|_| Box::pin(async move {
-            futures::future::pending::<()>().await;
-            Ok(())
-        }))
+        Box::new(|_| {
+            Box::pin(async move {
+                futures::future::pending::<()>().await;
+                Ok(())
+            })
+        })
     }
 
     /// [语义] 永不 settle 的回调不得让消息永久不可见（看门狗兜底回队）
@@ -1591,7 +1838,10 @@ mod tests {
         post_once(&provider, &address, "hung1").await?;
 
         assert!(wait_until(|| async { provider.pending_delivery_count() == 0 }).await);
-        assert_eq!(provider.status(address.clone()).await?.unread_count, Some(1));
+        assert_eq!(
+            provider.status(address.clone()).await?.unread_count,
+            Some(1)
+        );
         let fetched = provider.fetch(address, FetchOptions::default()).await?;
         assert_eq!(fetched.unwrap().message.id, "hung1");
         Ok(())
@@ -1609,14 +1859,17 @@ mod tests {
         let side_effects = counter();
         let slow = side_effects.clone();
         let _sub = provider
-            .subscribe(address.clone(), Box::new(move |_| {
-                let slow = slow.clone();
-                Box::pin(async move {
-                    tokio::time::sleep(Duration::from_millis(80)).await; // 比看门狗晚
-                    slow.fetch_add(1, Ordering::SeqCst);
-                    Ok(())
-                })
-            }))
+            .subscribe(
+                address.clone(),
+                Box::new(move |_| {
+                    let slow = slow.clone();
+                    Box::pin(async move {
+                        tokio::time::sleep(Duration::from_millis(80)).await; // 比看门狗晚
+                        slow.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    })
+                }),
+            )
             .await?;
 
         post_once(&provider, &address, "late1").await?;
@@ -1626,32 +1879,42 @@ mod tests {
         assert_eq!(side_effects.load(Ordering::SeqCst), 1);
         assert_eq!(dead.len(), 0);
         // 只有看门狗那一次回队；事后成功不会再把它投一遍
-        assert_eq!(provider.status(address.clone()).await?.unread_count, Some(1));
-        assert!(provider.fetch(address, FetchOptions::default()).await?.is_some());
+        assert_eq!(
+            provider.status(address.clone()).await?.unread_count,
+            Some(1)
+        );
+        assert!(provider
+            .fetch(address, FetchOptions::default())
+            .await?
+            .is_some());
         Ok(())
     }
 
     /// [语义] 看门狗不得打断健康的重试链（每次尝试各自计时）
     #[tokio::test]
     async fn test_watchdog_does_not_cut_a_healthy_retry_chain() -> Result<()> {
-        let provider = MemoryProvider::with_retry(Some(RetryPolicy::new(5, Duration::from_millis(5))));
+        let provider =
+            MemoryProvider::with_retry(Some(RetryPolicy::new(5, Duration::from_millis(5))));
         provider.set_delivery_settle_timeout(Duration::from_millis(60));
         let address = addr("watchdog-not-cutting-retry");
         let calls = counter();
 
         let c = calls.clone();
         let _sub = provider
-            .subscribe(address.clone(), Box::new(move |_| {
-                let c = c.clone();
-                Box::pin(async move {
-                    c.fetch_add(1, Ordering::SeqCst);
-                    tokio::time::sleep(Duration::from_millis(20)).await; // 单次尝试 < 看门狗，整条链 > 看门狗
-                    if c.load(Ordering::SeqCst) < 3 {
-                        return Err(MailboxError::Retriable("upstream down".to_string()));
-                    }
-                    Ok(())
-                })
-            }))
+            .subscribe(
+                address.clone(),
+                Box::new(move |_| {
+                    let c = c.clone();
+                    Box::pin(async move {
+                        c.fetch_add(1, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(20)).await; // 单次尝试 < 看门狗，整条链 > 看门狗
+                        if c.load(Ordering::SeqCst) < 3 {
+                            return Err(MailboxError::Retriable("upstream down".to_string()));
+                        }
+                        Ok(())
+                    })
+                }),
+            )
             .await?;
 
         post_once(&provider, &address, "retrychain1").await?;
@@ -1665,28 +1928,36 @@ mod tests {
     /// [语义] 看门狗不得打断退避等待（退避期间不计时）
     #[tokio::test]
     async fn test_watchdog_does_not_cut_the_backoff() -> Result<()> {
-        let provider = MemoryProvider::with_retry(Some(RetryPolicy::new(3, Duration::from_millis(80))));
+        let provider =
+            MemoryProvider::with_retry(Some(RetryPolicy::new(3, Duration::from_millis(80))));
         provider.set_delivery_settle_timeout(Duration::from_millis(20));
         let address = addr("watchdog-not-cutting-backoff");
         let calls = counter();
 
         let c = calls.clone();
         let _sub = provider
-            .subscribe(address.clone(), Box::new(move |_| {
-                let c = c.clone();
-                Box::pin(async move {
-                    if c.fetch_add(1, Ordering::SeqCst) < 1 {
-                        return Err(MailboxError::Retriable("upstream down".to_string()));
-                    }
-                    Ok(())
-                })
-            }))
+            .subscribe(
+                address.clone(),
+                Box::new(move |_| {
+                    let c = c.clone();
+                    Box::pin(async move {
+                        if c.fetch_add(1, Ordering::SeqCst) < 1 {
+                            return Err(MailboxError::Retriable("upstream down".to_string()));
+                        }
+                        Ok(())
+                    })
+                }),
+            )
             .await?;
 
         post_once(&provider, &address, "backoff2").await?;
 
         assert!(wait_until(|| async { provider.pending_delivery_count() == 0 }).await);
-        assert_eq!(calls.load(Ordering::SeqCst), 2, "退避 80ms > 看门狗 20ms，但不能被掐断");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "退避 80ms > 看门狗 20ms，但不能被掐断"
+        );
         assert_eq!(provider.status(address).await?.unread_count, Some(0));
         Ok(())
     }
@@ -1726,7 +1997,9 @@ mod tests {
         let provider = RawBroadcastProvider::new();
         let address: Url = "raw://bus/no-barrier".parse()?;
 
-        let _sub = provider.subscribe(address.clone(), failing_handler()).await?;
+        let _sub = provider
+            .subscribe(address.clone(), failing_handler())
+            .await?;
         provider
             .send(MailMessage {
                 id: "raw1".to_string(),
@@ -1738,7 +2011,10 @@ mod tests {
             })
             .await?;
 
-        assert!(wait_until(|| async { provider.queued(&address) == 1 }).await, "可重试失败必须仍可被 fetch 取回");
+        assert!(
+            wait_until(|| async { provider.queued(&address) == 1 }).await,
+            "可重试失败必须仍可被 fetch 取回"
+        );
         let fetched = provider.fetch(address, FetchOptions::default()).await?;
         assert_eq!(fetched.unwrap().message.id, "raw1");
         Ok(())
@@ -1750,7 +2026,9 @@ mod tests {
         let provider = MemoryProvider::new();
         let address = addr("local-producer");
 
-        let sub = provider.subscribe(address.clone(), failing_handler()).await?;
+        let sub = provider
+            .subscribe(address.clone(), failing_handler())
+            .await?;
         let reply = MailMessage {
             id: "reply-1".to_string(),
             from: "mem:rust-bus/sender".parse()?,
@@ -1759,14 +2037,27 @@ mod tests {
             headers: HashMap::new(),
             meta: HashMap::new(),
         };
-        let result = provider.deliver_to_local_subscription(sub.id(), reply).await;
+        let result = provider
+            .deliver_to_local_subscription(sub.id(), reply)
+            .await;
 
         assert!(!result.ok);
-        assert_eq!(provider.pending_delivery_count(), 0, "这次投递被记账并结算了");
-        assert!(wait_until(|| async {
-            provider.status(address.clone()).await.map(|s| s.unread_count == Some(1)).unwrap_or(false)
-        })
-        .await, "本地投递的失败同样要能被 fetch 兜底");
+        assert_eq!(
+            provider.pending_delivery_count(),
+            0,
+            "这次投递被记账并结算了"
+        );
+        assert!(
+            wait_until(|| async {
+                provider
+                    .status(address.clone())
+                    .await
+                    .map(|s| s.unread_count == Some(1))
+                    .unwrap_or(false)
+            })
+            .await,
+            "本地投递的失败同样要能被 fetch 兜底"
+        );
         let fetched = provider.fetch(address, FetchOptions::default()).await?;
         assert_eq!(fetched.unwrap().message.id, "reply-1");
         Ok(())
@@ -1781,14 +2072,17 @@ mod tests {
 
         let slow = side_effects.clone();
         let _sub = provider
-            .subscribe(address.clone(), Box::new(move |_| {
-                let slow = slow.clone();
-                Box::pin(async move {
-                    tokio::time::sleep(Duration::from_millis(40)).await;
-                    slow.fetch_add(1, Ordering::SeqCst);
-                    Ok(())
-                })
-            }))
+            .subscribe(
+                address.clone(),
+                Box::new(move |_| {
+                    let slow = slow.clone();
+                    Box::pin(async move {
+                        tokio::time::sleep(Duration::from_millis(40)).await;
+                        slow.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    })
+                }),
+            )
             .await?;
 
         post_once(&provider, &address, "close1").await?;
@@ -1798,28 +2092,42 @@ mod tests {
         assert!(wait_until(|| async { provider.pending_delivery_count() == 0 }).await);
         tokio::time::sleep(Duration::from_millis(60)).await;
         assert_eq!(side_effects.load(Ordering::SeqCst), 1);
-        assert_eq!(provider.status(address.clone()).await?.unread_count, Some(0));
+        assert_eq!(
+            provider.status(address.clone()).await?.unread_count,
+            Some(0)
+        );
         // close 自动退订：总线上的监听器也被摘掉
-        assert_eq!(provider.status(address).await?.extra.get("subscriber_count"), Some(&json!(0)));
+        assert_eq!(
+            provider
+                .status(address)
+                .await?
+                .extra
+                .get("subscriber_count"),
+            Some(&json!(0))
+        );
         Ok(())
     }
 
     /// [语义] 关闭会取消「等待重投」的投递：消息退回队列，回调不再被调
     #[tokio::test]
     async fn test_close_cancels_pending_retries() -> Result<()> {
-        let provider = MemoryProvider::with_retry(Some(RetryPolicy::new(5, Duration::from_millis(50))));
+        let provider =
+            MemoryProvider::with_retry(Some(RetryPolicy::new(5, Duration::from_millis(50))));
         let address = addr("close-during-backoff");
         let calls = counter();
 
         let c = calls.clone();
         let _sub = provider
-            .subscribe(address.clone(), Box::new(move |_| {
-                let c = c.clone();
-                Box::pin(async move {
-                    c.fetch_add(1, Ordering::SeqCst);
-                    Err(MailboxError::Retriable("outage".to_string()))
-                })
-            }))
+            .subscribe(
+                address.clone(),
+                Box::new(move |_| {
+                    let c = c.clone();
+                    Box::pin(async move {
+                        c.fetch_add(1, Ordering::SeqCst);
+                        Err(MailboxError::Retriable("outage".to_string()))
+                    })
+                }),
+            )
             .await?;
 
         post_once(&provider, &address, "close2").await?;
@@ -1828,27 +2136,40 @@ mod tests {
 
         assert!(wait_until(|| async { provider.pending_delivery_count() == 0 }).await);
         tokio::time::sleep(Duration::from_millis(120)).await;
-        assert_eq!(calls.load(Ordering::SeqCst), 1, "进程都在收尾，不再把消息重新喂回回调");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "进程都在收尾，不再把消息重新喂回回调"
+        );
         let fetched = provider.fetch(address, FetchOptions::default()).await?;
-        assert_eq!(fetched.unwrap().message.id, "close2", "取消不等于消息可以消失");
+        assert_eq!(
+            fetched.unwrap().message.id,
+            "close2",
+            "取消不等于消息可以消失"
+        );
         Ok(())
     }
 
     /// [事实] 重试耗尽钩子：预算用尽时把投递身份交给业务（写死信 / 告警）
     #[tokio::test]
     async fn test_retry_exhausted_hook_fires() -> Result<()> {
-        let provider = MemoryProvider::with_retry(Some(RetryPolicy::new(2, Duration::from_millis(1))));
+        let provider =
+            MemoryProvider::with_retry(Some(RetryPolicy::new(2, Duration::from_millis(1))));
         let address = addr("retry-exhausted-hook");
         let exhausted = counter();
 
         let fired = exhausted.clone();
-        provider.set_retry_exhausted_hook(Some(Arc::new(move |message: MailMessage, attempts: u32| {
-            assert_eq!(message.id, "exhausted2");
-            assert_eq!(attempts, 2);
-            fired.fetch_add(1, Ordering::SeqCst);
-        })));
+        provider.set_retry_exhausted_hook(Some(Arc::new(
+            move |message: MailMessage, attempts: u32| {
+                assert_eq!(message.id, "exhausted2");
+                assert_eq!(attempts, 2);
+                fired.fetch_add(1, Ordering::SeqCst);
+            },
+        )));
 
-        let _sub = provider.subscribe(address.clone(), failing_handler()).await?;
+        let _sub = provider
+            .subscribe(address.clone(), failing_handler())
+            .await?;
         post_once(&provider, &address, "exhausted2").await?;
 
         assert!(wait_until(|| async { exhausted.load(Ordering::SeqCst) >= 1 }).await);
@@ -1865,14 +2186,17 @@ mod tests {
 
     async fn post_body(provider: &MemoryProvider, to: &Url, id: &str, body: Value) -> Result<()> {
         provider
-            .send(OutgoingMail {
-                id: Some(id.to_string()),
-                from: "mem:rust-bus/sender".parse()?,
-                to: to.clone(),
-                body,
-                headers: HashMap::new(),
-                meta: HashMap::new(),
-            }.into())
+            .send(
+                OutgoingMail {
+                    id: Some(id.to_string()),
+                    from: "mem:rust-bus/sender".parse()?,
+                    to: to.clone(),
+                    body,
+                    headers: HashMap::new(),
+                    meta: HashMap::new(),
+                }
+                .into(),
+            )
             .await?;
         Ok(())
     }
@@ -1910,18 +2234,34 @@ mod tests {
         // 反复快照稳定；改副本改不到队列里的对象（Rust 的 `Clone` 即深拷贝）。
         let mut copy = snapshot[0].clone();
         copy.body = json!({ "tampered": true });
-        assert_eq!(provider.peek(address.clone(), None).await?[0].body, json!({ "n": 1 }));
+        assert_eq!(
+            provider.peek(address.clone(), None).await?[0].body,
+            json!({ "n": 1 })
+        );
 
         // 消息仍能被 FIFO 取走。
         assert_eq!(
-            provider.fetch(address.clone(), FetchOptions::default()).await?.unwrap().message.id,
+            provider
+                .fetch(address.clone(), FetchOptions::default())
+                .await?
+                .unwrap()
+                .message
+                .id,
             "peek-1"
         );
         assert_eq!(
-            provider.fetch(address.clone(), FetchOptions::default()).await?.unwrap().message.id,
+            provider
+                .fetch(address.clone(), FetchOptions::default())
+                .await?
+                .unwrap()
+                .message
+                .id,
             "peek-2"
         );
-        assert!(provider.fetch(address.clone(), FetchOptions::default()).await?.is_none());
+        assert!(provider
+            .fetch(address.clone(), FetchOptions::default())
+            .await?
+            .is_none());
         Ok(())
     }
 
@@ -1930,18 +2270,37 @@ mod tests {
         let provider = MemoryProvider::new();
         let address: Url = "mem:rust-bus/peek-limit".parse()?;
         for n in 1..=3 {
-            post_body(&provider, &address, &format!("limit-{}", n), json!({ "n": n })).await?;
+            post_body(
+                &provider,
+                &address,
+                &format!("limit-{}", n),
+                json!({ "n": n }),
+            )
+            .await?;
         }
 
         assert!(provider.peek(address.clone(), Some(0)).await?.is_empty());
         assert_eq!(
-            provider.peek(address.clone(), Some(2)).await?
-                .iter().map(|m| m.body["n"].as_i64().unwrap()).collect::<Vec<_>>(),
+            provider
+                .peek(address.clone(), Some(2))
+                .await?
+                .iter()
+                .map(|m| m.body["n"].as_i64().unwrap())
+                .collect::<Vec<_>>(),
             vec![1, 2]
         );
-        assert_eq!(provider.peek(address.clone(), Some(usize::MAX)).await?.len(), 3);
+        assert_eq!(
+            provider
+                .peek(address.clone(), Some(usize::MAX))
+                .await?
+                .len(),
+            3
+        );
         assert_eq!(provider.peek(address.clone(), None).await?.len(), 3);
-        assert_eq!(provider.status(address.clone()).await?.unread_count, Some(3)); // limit 不消耗消息
+        assert_eq!(
+            provider.status(address.clone()).await?.unread_count,
+            Some(3)
+        ); // limit 不消耗消息
         Ok(())
     }
 
@@ -1952,14 +2311,22 @@ mod tests {
         post_body(&provider, &address, "inflight-1", json!({ "n": 1 })).await?;
         post_body(&provider, &address, "inflight-2", json!({ "n": 2 })).await?;
 
-        let options = FetchOptions { manual_ack: true, ack_timeout: None, ..Default::default() };
+        let options = FetchOptions {
+            manual_ack: true,
+            ack_timeout: None,
+            ..Default::default()
+        };
         let inflight = provider.fetch(address.clone(), options).await?.unwrap();
         assert_eq!(inflight.message.body, json!({ "n": 1 }));
 
         // 不会把另一个消费者手上的消息也列出来。
         assert_eq!(
-            provider.peek(address.clone(), None).await?
-                .iter().map(|m| m.body["n"].as_i64().unwrap()).collect::<Vec<_>>(),
+            provider
+                .peek(address.clone(), None)
+                .await?
+                .iter()
+                .map(|m| m.body["n"].as_i64().unwrap())
+                .collect::<Vec<_>>(),
             vec![2]
         );
 
@@ -1989,7 +2356,9 @@ mod tests {
     #[tokio::test]
     async fn test_an_address_that_was_never_touched_is_unknown() -> Result<()> {
         let provider = MemoryProvider::new();
-        let status = provider.status("mem:rust-bus/never-touched".parse()?).await?;
+        let status = provider
+            .status("mem:rust-bus/never-touched".parse()?)
+            .await?;
 
         assert_eq!(status.state, "unknown"); // 不是“online + 0”
         assert_eq!(status.exists, Some(false));
@@ -2018,7 +2387,9 @@ mod tests {
         let provider = MemoryProvider::new();
         let address: Url = "mem:rust-bus/drained".parse()?;
         post_body(&provider, &address, "drained-1", json!({ "n": 1 })).await?;
-        provider.fetch(address.clone(), FetchOptions::default()).await?;
+        provider
+            .fetch(address.clone(), FetchOptions::default())
+            .await?;
 
         let status = provider.status(address).await?;
         assert_eq!(status.exists, Some(true));
@@ -2048,7 +2419,13 @@ mod tests {
         let address: Url = "mem:rust-bus/inflight-exists".parse()?;
         post_body(&provider, &address, "inflight-exists-1", json!({ "n": 1 })).await?;
         provider
-            .fetch(address.clone(), FetchOptions { manual_ack: true, ..Default::default() })
+            .fetch(
+                address.clone(),
+                FetchOptions {
+                    manual_ack: true,
+                    ..Default::default()
+                },
+            )
             .await?;
 
         let status = provider.status(address).await?;
@@ -2065,25 +2442,34 @@ mod tests {
         let with_query: Url = "mem:rust-bus/reject?thread=1".parse()?;
         let with_hash: Url = "mem:rust-bus/reject#frag".parse()?;
 
-        let error = expect_err(provider
-            .send(MailMessage {
-                id: "direct-1".to_string(),
-                from: "mem:rust-bus/sender".parse()?,
-                to: with_query.clone(),
-                body: json!({}),
-                headers: HashMap::new(),
-                meta: HashMap::new(),
-            })
-            .await);
+        let error = expect_err(
+            provider
+                .send(MailMessage {
+                    id: "direct-1".to_string(),
+                    from: "mem:rust-bus/sender".parse()?,
+                    to: with_query.clone(),
+                    body: json!({}),
+                    headers: HashMap::new(),
+                    meta: HashMap::new(),
+                })
+                .await,
+        );
         assert_eq!(error.code(), Some("MBX_INVALID_ADDRESS"));
-        assert!(error.to_string().contains("would be dropped by address canonicalization"));
+        assert!(error
+            .to_string()
+            .contains("would be dropped by address canonicalization"));
 
         assert_eq!(
             expect_err(provider.subscribe(with_query.clone(), ok_handler()).await).code(),
             Some("MBX_INVALID_ADDRESS")
         );
         assert_eq!(
-            expect_err(provider.fetch(with_hash.clone(), FetchOptions::default()).await).code(),
+            expect_err(
+                provider
+                    .fetch(with_hash.clone(), FetchOptions::default())
+                    .await
+            )
+            .code(),
             Some("MBX_INVALID_ADDRESS")
         );
         assert_eq!(
@@ -2113,16 +2499,33 @@ mod tests {
         post_body(&provider, &thread_one, "part-1", json!({ "thread": 1 })).await?;
         post_body(&provider, &thread_two, "part-2", json!({ "thread": 2 })).await?;
 
-        assert_eq!(provider.status(thread_one.clone()).await?.unread_count, Some(1));
-        assert_eq!(provider.status(thread_two.clone()).await?.unread_count, Some(1));
+        assert_eq!(
+            provider.status(thread_one.clone()).await?.unread_count,
+            Some(1)
+        );
+        assert_eq!(
+            provider.status(thread_two.clone()).await?.unread_count,
+            Some(1)
+        );
 
         // 取一个分区不会动到另一个分区。
-        let fetched = provider.fetch(thread_one.clone(), FetchOptions::default()).await?.unwrap();
+        let fetched = provider
+            .fetch(thread_one.clone(), FetchOptions::default())
+            .await?
+            .unwrap();
         assert_eq!(fetched.message.body, json!({ "thread": 1 }));
         assert_eq!(provider.status(thread_one).await?.unread_count, Some(0));
-        assert_eq!(provider.status(thread_two.clone()).await?.unread_count, Some(1));
         assert_eq!(
-            provider.fetch(thread_two, FetchOptions::default()).await?.unwrap().message.body,
+            provider.status(thread_two.clone()).await?.unread_count,
+            Some(1)
+        );
+        assert_eq!(
+            provider
+                .fetch(thread_two, FetchOptions::default())
+                .await?
+                .unwrap()
+                .message
+                .body,
             json!({ "thread": 2 })
         );
         Ok(())
@@ -2131,12 +2534,26 @@ mod tests {
     #[tokio::test]
     async fn test_opaque_and_hierarchical_spellings_are_the_same_address() -> Result<()> {
         let provider = MemoryProvider::new();
-        post_body(&provider, &"mem:rust-bus/eq-spelling/inbox".parse()?, "eq-1", json!({ "n": 1 })).await?;
+        post_body(
+            &provider,
+            &"mem:rust-bus/eq-spelling/inbox".parse()?,
+            "eq-1",
+            json!({ "n": 1 }),
+        )
+        .await?;
 
         let hierarchical: Url = "mem://rust-bus/eq-spelling/inbox".parse()?;
-        assert_eq!(provider.status(hierarchical.clone()).await?.unread_count, Some(1));
         assert_eq!(
-            provider.fetch(hierarchical, FetchOptions::default()).await?.unwrap().message.body,
+            provider.status(hierarchical.clone()).await?.unread_count,
+            Some(1)
+        );
+        assert_eq!(
+            provider
+                .fetch(hierarchical, FetchOptions::default())
+                .await?
+                .unwrap()
+                .message
+                .body,
             json!({ "n": 1 })
         );
         Ok(())
@@ -2150,7 +2567,14 @@ mod tests {
 
         let error = expect_err(
             provider
-                .fetch(address.clone(), FetchOptions { peek: true, manual_ack: true, ..Default::default() })
+                .fetch(
+                    address.clone(),
+                    FetchOptions {
+                        peek: true,
+                        manual_ack: true,
+                        ..Default::default()
+                    },
+                )
                 .await,
         );
         assert_eq!(error.code(), Some("MBX_INVALID_FETCH_OPTIONS"));
@@ -2181,7 +2605,10 @@ mod tests {
         let error = expect_err(provider.peek(address.clone(), None).await);
         assert_eq!(error.code(), Some("MBX_UNSUPPORTED_CAPABILITY"));
         match error {
-            MailboxError::UnsupportedCapability { protocol, capability } => {
+            MailboxError::UnsupportedCapability {
+                protocol,
+                capability,
+            } => {
                 assert_eq!(protocol, "raw");
                 assert!(capability.contains("read-only peek"), "{}", capability);
             }
@@ -2196,7 +2623,18 @@ mod tests {
         );
         // 直接用 `fetch(peek: true)` 也不会被静默降级。
         assert_eq!(
-            expect_err(provider.fetch(address.clone(), FetchOptions { peek: true, ..Default::default() }).await).code(),
+            expect_err(
+                provider
+                    .fetch(
+                        address.clone(),
+                        FetchOptions {
+                            peek: true,
+                            ..Default::default()
+                        }
+                    )
+                    .await
+            )
+            .code(),
             Some("MBX_INVALID_FETCH_OPTIONS")
         );
         assert_eq!(provider.queued(&address), 1);
@@ -2277,7 +2715,11 @@ mod tests {
                     ..ProviderCoreOptions::default()
                 },
             );
-            Self { core, topics, queue }
+            Self {
+                core,
+                topics,
+                queue,
+            }
         }
 
         fn queued(&self, address: &Url) -> usize {
@@ -2296,7 +2738,13 @@ mod tests {
 
         async fn _send(&self, message: MailMessage) -> Result<()> {
             let topic = get_canonical_mailbox_address_identifier(&message.to)?;
-            let listeners = self.topics.read().unwrap().get(&topic).cloned().unwrap_or_default();
+            let listeners = self
+                .topics
+                .read()
+                .unwrap()
+                .get(&topic)
+                .cloned()
+                .unwrap_or_default();
             if listeners.is_empty() {
                 self.queue.lock().unwrap().enqueue(topic, message);
                 return Ok(());
@@ -2324,21 +2772,28 @@ mod tests {
                 .push(listener.clone());
 
             let topics = self.topics.clone();
-            self.core.attach_unsubscribe(&sub_id, Box::new(move || {
-                let topics = topics.clone();
-                let topic = topic.clone();
-                let listener = listener.clone();
-                Box::pin(async move {
-                    if let Some(listeners) = topics.write().unwrap().get_mut(&topic) {
-                        listeners.retain(|l| !Arc::ptr_eq(l, &listener));
-                    }
-                    Ok(())
-                })
-            }));
+            self.core.attach_unsubscribe(
+                &sub_id,
+                Box::new(move || {
+                    let topics = topics.clone();
+                    let topic = topic.clone();
+                    let listener = listener.clone();
+                    Box::pin(async move {
+                        if let Some(listeners) = topics.write().unwrap().get_mut(&topic) {
+                            listeners.retain(|l| !Arc::ptr_eq(l, &listener));
+                        }
+                        Ok(())
+                    })
+                }),
+            );
             Ok(self.core.subscription_object(sub_id))
         }
 
-        async fn fetch(&self, address: Url, options: FetchOptions) -> Result<Option<AckableMessage>> {
+        async fn fetch(
+            &self,
+            address: Url,
+            options: FetchOptions,
+        ) -> Result<Option<AckableMessage>> {
             // 这个第三方写法示范：入口必须挡住 `peek`，否则只读快照会被静默当成取件。
             reject_peek_in_fetch(&options)?;
 
@@ -2385,13 +2840,21 @@ mod tests {
 
     /// 即便跑在共享 bus 上，用例之间也不能互相看到对方的 topic。
     fn iso_addr(label: &str) -> Url {
-        format!("mem:iso{}-{}@bus/inbox", ISO_SEQ.fetch_add(1, Ordering::SeqCst), label)
-            .parse()
-            .unwrap()
+        format!(
+            "mem:iso{}-{}@bus/inbox",
+            ISO_SEQ.fetch_add(1, Ordering::SeqCst),
+            label
+        )
+        .parse()
+        .unwrap()
     }
 
     fn iso_scope(label: &str) -> String {
-        format!("iso-suite-{}-{}", label, ISO_SEQ.fetch_add(1, Ordering::SeqCst))
+        format!(
+            "iso-suite-{}-{}",
+            label,
+            ISO_SEQ.fetch_add(1, Ordering::SeqCst)
+        )
     }
 
     fn iso_mailbox(provider: MemoryProvider) -> Mailbox {
@@ -2512,7 +2975,9 @@ mod tests {
         x.add_listener(topic, counting_listener(hits.clone()));
 
         // x 上有订阅者：走广播，不入队。
-        let deliveries = x.publish(topic, bus_msg("x-1", topic)).expect("有订阅者：必须返回结算 future");
+        let deliveries = x
+            .publish(topic, bus_msg("x-1", topic))
+            .expect("有订阅者：必须返回结算 future");
         assert_eq!(deliveries.len(), 1);
         for settlement in deliveries {
             settlement.await;
@@ -2527,13 +2992,17 @@ mod tests {
         assert_eq!(x.status_of(topic).subscriber_count, 1);
 
         // 取消息也不会跨 bus。
-        assert_eq!(y.dequeue(topic).map(|message| message.id), Some("y-1".to_string()));
+        assert_eq!(
+            y.dequeue(topic).map(|message| message.id),
+            Some("y-1".to_string())
+        );
         assert!(x.dequeue(topic).is_none());
 
         // in-flight 也是各自一份。
         y.publish(topic, bus_msg("y-2", topic));
         assert_eq!(
-            y.dequeue_for_ack(topic, Some(Duration::from_secs(1))).map(|message| message.id),
+            y.dequeue_for_ack(topic, Some(Duration::from_secs(1)))
+                .map(|message| message.id),
             Some("y-2".to_string())
         );
         assert_eq!(y.status_of(topic).in_flight_count, 1);
@@ -2541,8 +3010,14 @@ mod tests {
 
         // last_activity 各自一份：y 没碰过的 topic 在 y 上是空的。
         x.publish("mem:only-on-x/inbox", bus_msg("x-2", "mem:only-on-x/inbox"));
-        assert!(x.status_of("mem:only-on-x/inbox").last_activity_time.is_some());
-        assert!(y.status_of("mem:only-on-x/inbox").last_activity_time.is_none());
+        assert!(x
+            .status_of("mem:only-on-x/inbox")
+            .last_activity_time
+            .is_some());
+        assert!(y
+            .status_of("mem:only-on-x/inbox")
+            .last_activity_time
+            .is_none());
         Ok(())
     }
 
@@ -2558,10 +3033,13 @@ mod tests {
         let _sub = b.subscribe(addr.clone(), counting(hits.clone())).await?;
 
         post_once(&a, &addr, "shared-bus-1").await?;
-        assert!(wait_until(|| {
-            let hits = hits.clone();
-            async move { hits.load(Ordering::SeqCst) >= 1 }
-        }).await);
+        assert!(
+            wait_until(|| {
+                let hits = hits.clone();
+                async move { hits.load(Ordering::SeqCst) >= 1 }
+            })
+            .await
+        );
         // 订阅表是这份 bus 共有的：A 也看得见 B 的订阅。
         assert_eq!(subscriber_count(&a.status(addr).await?), 1);
         Ok(())
@@ -2582,10 +3060,13 @@ mod tests {
         let a = iso_mailbox(a);
         a.start().await?;
         a.post(iso_mail(&addr, json!({ "n": 1 }))).await?;
-        assert!(wait_until(|| {
-            let hits = hits.clone();
-            async move { hits.load(Ordering::SeqCst) >= 1 }
-        }).await);
+        assert!(
+            wait_until(|| {
+                let hits = hits.clone();
+                async move { hits.load(Ordering::SeqCst) >= 1 }
+            })
+            .await
+        );
         Ok(())
     }
 
@@ -2599,13 +3080,17 @@ mod tests {
         a.post(iso_mail(&addr, json!({ "from": "A" }))).await?;
 
         let taken = b.fetch(addr.clone(), FetchOptions::default()).await?;
-        assert_eq!(taken.map(|taken| taken.message.body), Some(json!({ "from": "A" })));
+        assert_eq!(
+            taken.map(|taken| taken.message.body),
+            Some(json!({ "from": "A" }))
+        );
         assert_eq!(a.status(addr).await?.unread_count, Some(0));
         Ok(())
     }
 
     #[tokio::test]
-    async fn test_create_isolated_keeps_broadcasts_queues_and_subscriber_tables_apart() -> Result<()> {
+    async fn test_create_isolated_keeps_broadcasts_queues_and_subscriber_tables_apart() -> Result<()>
+    {
         let addr = iso_addr("isolated-broadcast");
         let a = iso_mailbox(MemoryProvider::create_isolated(None));
         let b = iso_mailbox(MemoryProvider::create_isolated(None));
@@ -2631,10 +3116,16 @@ mod tests {
 
         a.post(iso_mail(&addr, json!({ "from": "A" }))).await?;
 
-        assert!(b.fetch(addr.clone(), FetchOptions::default()).await?.is_none());
+        assert!(b
+            .fetch(addr.clone(), FetchOptions::default())
+            .await?
+            .is_none());
         assert_eq!(b.status(addr.clone()).await?.unread_count, Some(0));
         let mine = a.fetch(addr, FetchOptions::default()).await?;
-        assert_eq!(mine.map(|mine| mine.message.body), Some(json!({ "from": "A" })));
+        assert_eq!(
+            mine.map(|mine| mine.message.body),
+            Some(json!({ "from": "A" }))
+        );
         Ok(())
     }
 
@@ -2660,10 +3151,13 @@ mod tests {
         a.stop().await?; // 只停 A
 
         b.post(iso_mail(&addr, json!({ "n": 1 }))).await?;
-        assert!(wait_until(|| {
-            let hits = hits.clone();
-            async move { hits.load(Ordering::SeqCst) >= 1 }
-        }).await);
+        assert!(
+            wait_until(|| {
+                let hits = hits.clone();
+                async move { hits.load(Ordering::SeqCst) >= 1 }
+            })
+            .await
+        );
         Ok(())
     }
 
@@ -2677,20 +3171,28 @@ mod tests {
         let b = iso_mailbox(MemoryProvider::create_isolated(None));
 
         let calls = Arc::new(AtomicUsize::new(0));
-        let _sub = a.subscribe(scope_addr.clone(), always_failing(calls.clone())).await?;
+        let _sub = a
+            .subscribe(scope_addr.clone(), always_failing(calls.clone()))
+            .await?;
 
         a.post(iso_mail(&scope_addr, json!({ "n": 1 }))).await?;
 
-        assert!(wait_until(|| {
-            let calls = calls.clone();
-            async move { calls.load(Ordering::SeqCst) >= 3 }
-        }).await);
+        assert!(
+            wait_until(|| {
+                let calls = calls.clone();
+                async move { calls.load(Ordering::SeqCst) >= 3 }
+            })
+            .await
+        );
         tokio::time::sleep(Duration::from_millis(30)).await;
         assert_eq!(calls.load(Ordering::SeqCst), 3); // maxAttempts = 3，三次后放弃
-        // 重试耗尽：消息回自己的队列，由 fetch 兜底；别的实例看不到。
-        assert!(wait_until(|| async {
-            matches!(a.status(scope_addr.clone()).await, Ok(s) if s.unread_count == Some(1))
-        }).await);
+                                                     // 重试耗尽：消息回自己的队列，由 fetch 兜底；别的实例看不到。
+        assert!(
+            wait_until(|| async {
+                matches!(a.status(scope_addr.clone()).await, Ok(s) if s.unread_count == Some(1))
+            })
+            .await
+        );
         assert_eq!(b.status(scope_addr).await?.unread_count, Some(0));
         Ok(())
     }
@@ -2703,13 +3205,18 @@ mod tests {
         let b = iso_mailbox(MemoryProvider::create_isolated(None));
 
         let calls = Arc::new(AtomicUsize::new(0));
-        let _sub = a.subscribe(addr.clone(), always_failing(calls.clone())).await?;
+        let _sub = a
+            .subscribe(addr.clone(), always_failing(calls.clone()))
+            .await?;
 
         a.post(iso_mail(&addr, json!({ "n": 1 }))).await?;
 
-        assert!(wait_until(|| async {
-            matches!(a.status(addr.clone()).await, Ok(s) if s.unread_count == Some(1))
-        }).await);
+        assert!(
+            wait_until(|| async {
+                matches!(a.status(addr.clone()).await, Ok(s) if s.unread_count == Some(1))
+            })
+            .await
+        );
         let mine = a.fetch(addr.clone(), FetchOptions::default()).await?;
         assert_eq!(mine.map(|mine| mine.message.body), Some(json!({ "n": 1 }))); // A 自己能取回
         assert_eq!(b.status(addr).await?.unread_count, Some(0));
@@ -2725,7 +3232,10 @@ mod tests {
         let provider_a = MemoryProvider::for_scope(&scope, None);
         let provider_b = MemoryProvider::for_scope(&scope, None);
         assert_eq!(provider_a.bus(), provider_b.bus());
-        assert_eq!(provider_a.bus(), &MemoryEventBus::get_instance(Some(&scope)));
+        assert_eq!(
+            provider_a.bus(),
+            &MemoryEventBus::get_instance(Some(&scope))
+        );
         assert_ne!(provider_a.bus(), &MemoryEventBus::get_instance(None));
         assert_eq!(provider_a.bus().scope(), scope);
 
@@ -2738,10 +3248,14 @@ mod tests {
         let _sub = b.subscribe(addr.clone(), counting(hits.clone())).await?;
 
         a.post(iso_mail(&addr, json!({ "n": 1 }))).await?;
-        assert!(wait_until(|| {
-            let hits = hits.clone();
-            async move { hits.load(Ordering::SeqCst) >= 1 }
-        }).await, "同 scope 必须互通");
+        assert!(
+            wait_until(|| {
+                let hits = hits.clone();
+                async move { hits.load(Ordering::SeqCst) >= 1 }
+            })
+            .await,
+            "同 scope 必须互通"
+        );
 
         // 异 scope 与默认 bus 都看不见这份状态。
         assert_eq!(elsewhere.status(addr.clone()).await?.unread_count, Some(0));
@@ -2756,12 +3270,22 @@ mod tests {
 
         assert_eq!(MemoryProvider::with_bus(bus.clone(), None).bus(), &bus);
         assert_eq!(
-            MemoryProvider::with_bus(bus.clone(), Some(RetryPolicy::new(2, Duration::from_millis(1)))).bus(),
+            MemoryProvider::with_bus(
+                bus.clone(),
+                Some(RetryPolicy::new(2, Duration::from_millis(1)))
+            )
+            .bus(),
             &bus
         );
         // 不注入则回落默认单例（向后兼容）。
-        assert_eq!(MemoryProvider::new().bus(), &MemoryEventBus::get_instance(None));
-        assert_eq!(MemoryProvider::default().bus(), &MemoryEventBus::get_instance(None));
+        assert_eq!(
+            MemoryProvider::new().bus(),
+            &MemoryEventBus::get_instance(None)
+        );
+        assert_eq!(
+            MemoryProvider::default().bus(),
+            &MemoryEventBus::get_instance(None)
+        );
     }
 
     #[tokio::test]
@@ -2778,7 +3302,9 @@ mod tests {
 
         let hits = Arc::new(AtomicUsize::new(0));
         let mut b_sub = b.subscribe(addr.clone(), counting(hits.clone())).await?;
-        let a_sub = a.subscribe(addr.clone(), Box::new(|_| Box::pin(async { Ok(()) }))).await?;
+        let a_sub = a
+            .subscribe(addr.clone(), Box::new(|_| Box::pin(async { Ok(()) })))
+            .await?;
 
         a.stop().await?; // 只拆 A 这一侧
 
@@ -2786,17 +3312,21 @@ mod tests {
         assert_eq!(b_sub.status(), SubscriptionStatus::Active);
 
         b.post(iso_mail(&addr, json!({ "n": 1 }))).await?;
-        assert!(wait_until(|| {
-            let hits = hits.clone();
-            async move { hits.load(Ordering::SeqCst) >= 1 }
-        }).await);
+        assert!(
+            wait_until(|| {
+                let hits = hits.clone();
+                async move { hits.load(Ordering::SeqCst) >= 1 }
+            })
+            .await
+        );
         assert_eq!(subscriber_count(&b.status(addr).await?), 1); // A 的订阅已从这份 bus 上摘掉
         b_sub.unsubscribe().await?;
         Ok(())
     }
 
     #[tokio::test]
-    async fn test_bus_clear_topic_drops_queued_and_in_flight_but_keeps_subscriptions() -> Result<()> {
+    async fn test_bus_clear_topic_drops_queued_and_in_flight_but_keeps_subscriptions() -> Result<()>
+    {
         let bus = MemoryEventBus::new();
         let provider = MemoryProvider::with_bus(bus.clone(), None);
         let mailbox = iso_mailbox(provider);
@@ -2809,10 +3339,19 @@ mod tests {
         mailbox.post(iso_mail(&dropped, json!({ "n": 2 }))).await?;
 
         let taken = mailbox
-            .fetch(dropped.clone(), FetchOptions { manual_ack: true, ..Default::default() })
+            .fetch(
+                dropped.clone(),
+                FetchOptions {
+                    manual_ack: true,
+                    ..Default::default()
+                },
+            )
             .await?;
         assert!(taken.is_some());
-        assert_eq!(mailbox.status(dropped.clone()).await?.in_flight_count, Some(1));
+        assert_eq!(
+            mailbox.status(dropped.clone()).await?.in_flight_count,
+            Some(1)
+        );
 
         let topic = get_canonical_mailbox_address_identifier(&dropped)?;
         assert_eq!(bus.clear(Some(&topic)), 2); // 1 条等待 + 1 条 in-flight
@@ -2839,7 +3378,13 @@ mod tests {
 
         post_once(&provider, &addr, "late-1").await?;
         let taken = provider
-            .fetch(addr.clone(), FetchOptions { manual_ack: true, ..Default::default() })
+            .fetch(
+                addr.clone(),
+                FetchOptions {
+                    manual_ack: true,
+                    ..Default::default()
+                },
+            )
             .await?
             .expect("必须取到那封信");
         assert_eq!(bus.status_of(&topic).in_flight_count, 1);
@@ -2889,7 +3434,10 @@ mod tests {
         let hits = Arc::new(AtomicUsize::new(0));
         bus.add_listener(topic, counting_listener(hits.clone()));
 
-        for settlement in bus.publish(topic, bus_msg("before", topic)).expect("有订阅者：走广播") {
+        for settlement in bus
+            .publish(topic, bus_msg("before", topic))
+            .expect("有订阅者：走广播")
+        {
             settlement.await;
         }
         assert_eq!(hits.load(Ordering::SeqCst), 1);
@@ -2897,7 +3445,10 @@ mod tests {
         assert_eq!(bus.clear(Some(topic)), 0);
         assert_eq!(bus.status_of(topic).subscriber_count, 1); // 订阅表未被拆
 
-        for settlement in bus.publish(topic, bus_msg("after", topic)).expect("有订阅者：走广播") {
+        for settlement in bus
+            .publish(topic, bus_msg("after", topic))
+            .expect("有订阅者：走广播")
+        {
             settlement.await;
         }
         assert_eq!(hits.load(Ordering::SeqCst), 2); // 清理之后照旧投递

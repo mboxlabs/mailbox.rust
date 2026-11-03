@@ -49,7 +49,8 @@ pub trait Subscription: Send + Sync {
  * 取回），不可重试错误按死信丢弃。与 TS / Python 端 `subscribe` 包装回调的语义一致——
  * 之前 Rust 端回调返回 `()`，订阅者失败等于消息静默消失。
  */
-pub type SubscriptionHandler = Box<dyn Fn(MailMessage) -> BoxFuture<'static, Result<()>> + Send + Sync>;
+pub type SubscriptionHandler =
+    Box<dyn Fn(MailMessage) -> BoxFuture<'static, Result<()>> + Send + Sync>;
 
 /**
  * 订阅回调失败时的统一处理：记录日志，并返回是否应当回队。
@@ -59,8 +60,15 @@ pub type SubscriptionHandler = Box<dyn Fn(MailMessage) -> BoxFuture<'static, Res
  * 只适用于**不使用** [`crate::core::ProviderCore`] 的第三方 provider：走 core 的投递记账
  * 已经包含日志、可重试判定、重试与 barrier，不要再自己处理一遍。
  */
-pub fn handle_subscription_error(protocol: &str, error: &MailboxError, message: &MailMessage) -> bool {
-    eprintln!("[{}] Error processing message {}: {}", protocol, message.id, error);
+pub fn handle_subscription_error(
+    protocol: &str,
+    error: &MailboxError,
+    message: &MailMessage,
+) -> bool {
+    eprintln!(
+        "[{}] Error processing message {}: {}",
+        protocol, message.id, error
+    );
     error.is_retriable()
 }
 
@@ -152,10 +160,9 @@ pub trait MailboxProvider: Send + Sync {
     async fn send(&self, message: MailMessage) -> Result<MailMessage> {
         let mut message = message;
         // Always inject mbx-sent-at for outgoing messages（不改调用方传进来的对象之外语义）
-        message.headers.insert(
-            "mbx-sent-at".to_string(),
-            chrono::Utc::now().to_rfc3339(),
-        );
+        message
+            .headers
+            .insert("mbx-sent-at".to_string(), chrono::Utc::now().to_rfc3339());
         self._send(message.clone()).await?;
         Ok(message)
     }
@@ -175,7 +182,7 @@ pub trait MailboxProvider: Send + Sync {
     async fn subscribe(
         &self,
         address: Url,
-        callback: SubscriptionHandler
+        callback: SubscriptionHandler,
     ) -> Result<Box<dyn Subscription>>;
 
     /**
@@ -199,7 +206,10 @@ pub trait MailboxProvider: Send + Sync {
      */
     async fn peek(&self, address: Url, limit: Option<usize>) -> Result<Vec<MailMessage>> {
         let _ = (address, limit);
-        Err(MailboxError::unsupported_capability(self.protocol(), PEEK_CAPABILITY))
+        Err(MailboxError::unsupported_capability(
+            self.protocol(),
+            PEEK_CAPABILITY,
+        ))
     }
 
     /**

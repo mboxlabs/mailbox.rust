@@ -53,8 +53,8 @@ impl RetryPolicy {
 pub fn next_retry_delay(policy: &RetryPolicy, attempt: u32) -> Duration {
     let resolved = policy.resolved();
     let safe_attempt = attempt.max(1);
-    let micros = resolved.base_delay.as_micros() as f64
-        * resolved.factor.powi(safe_attempt as i32 - 1);
+    let micros =
+        resolved.base_delay.as_micros() as f64 * resolved.factor.powi(safe_attempt as i32 - 1);
     let delay = Duration::from_micros(micros.max(0.0) as u64);
     if delay > resolved.max_delay {
         resolved.max_delay
@@ -74,7 +74,10 @@ pub struct AttemptLedger {
 
 impl AttemptLedger {
     pub fn new(ttl: Duration) -> Self {
-        Self { entries: HashMap::new(), ttl }
+        Self {
+            entries: HashMap::new(),
+            ttl,
+        }
     }
 
     /// 记录一次尝试，返回这是第几次。
@@ -96,7 +99,8 @@ impl AttemptLedger {
 
     /// 处理成功后清零，让同 id 的消息日后还能重试。
     pub fn reset(&mut self, subscription_id: &str, message_id: &str) {
-        self.entries.remove(&(subscription_id.to_string(), message_id.to_string()));
+        self.entries
+            .remove(&(subscription_id.to_string(), message_id.to_string()));
     }
 
     pub fn clear(&mut self) {
@@ -113,7 +117,8 @@ impl AttemptLedger {
 
     fn gc(&mut self) {
         let now = Instant::now();
-        self.entries.retain(|_, (_, updated_at)| now.duration_since(*updated_at) <= self.ttl);
+        self.entries
+            .retain(|_, (_, updated_at)| now.duration_since(*updated_at) <= self.ttl);
     }
 }
 

@@ -1,12 +1,14 @@
-use std::collections::HashMap;
-use std::sync::Arc;
-use url::Url;
 use crate::error::{MailboxError, Result};
 use crate::message::{
     FetchOptions, MailMessage, MailboxAddressSnapshot, MailboxSnapshot, MailboxStatus, OutgoingMail,
 };
-use crate::provider::{reject_peek_in_fetch, AckableMessage, MailboxProvider, Subscription, SubscriptionHandler};
+use crate::provider::{
+    reject_peek_in_fetch, AckableMessage, MailboxProvider, Subscription, SubscriptionHandler,
+};
 use crate::utils::{assert_lossless_mailbox_address, normalize_peek_limit};
+use std::collections::HashMap;
+use std::sync::Arc;
+use url::Url;
 
 #[derive(Clone)]
 pub struct Mailbox {
@@ -32,7 +34,11 @@ impl Mailbox {
      * @param protocol 协议名（例如 "mem" 或 "mem:"）
      * @param raise_error_if_failed 如果为 true，且找不到 Provider 时返回错误。
      */
-    pub fn get_provider(&self, protocol: &str, raise_error_if_failed: bool) -> Result<Option<Arc<dyn MailboxProvider>>> {
+    pub fn get_provider(
+        &self,
+        protocol: &str,
+        raise_error_if_failed: bool,
+    ) -> Result<Option<Arc<dyn MailboxProvider>>> {
         let key = protocol.strip_suffix(':').unwrap_or(protocol);
 
         match self.providers.get(key) {
@@ -64,7 +70,7 @@ impl Mailbox {
         for provider in self.providers.values() {
             futures.push(provider.init());
         }
-        
+
         // 并行初始化
         let results = futures::future::join_all(futures).await;
         for res in results {
@@ -86,7 +92,7 @@ impl Mailbox {
         for provider in self.providers.values() {
             futures.push(provider.close());
         }
-        
+
         // 并行关闭
         let results = futures::future::join_all(futures).await;
         for res in results {
@@ -131,7 +137,8 @@ impl Mailbox {
     }
 
     pub fn register_provider(&mut self, provider: Box<dyn MailboxProvider>) {
-        self.providers.insert(provider.protocol().to_string(), Arc::from(provider));
+        self.providers
+            .insert(provider.protocol().to_string(), Arc::from(provider));
     }
 
     pub async fn post(&self, mail: OutgoingMail) -> Result<MailMessage> {
@@ -143,7 +150,7 @@ impl Mailbox {
 
         let mut message: MailMessage = mail.clone().into();
         if message.id.is_empty() {
-             message.id = provider.generate_id();
+            message.id = provider.generate_id();
         }
 
         provider.send(message).await
@@ -175,7 +182,11 @@ impl Mailbox {
      * （对应 TS / Python 的 `fetch(addr, { peek: true })`）。`options.peek == true` 会在入口报错，
      * 不会被静默降级成普通取信。
      */
-    pub async fn fetch(&self, address: Url, options: FetchOptions) -> Result<Option<AckableMessage>> {
+    pub async fn fetch(
+        &self,
+        address: Url,
+        options: FetchOptions,
+    ) -> Result<Option<AckableMessage>> {
         assert_lossless_mailbox_address(&address, "fetch()")?;
         reject_peek_in_fetch(&options)?;
 
@@ -353,10 +364,10 @@ mod tests {
     async fn test_mailbox_lifecycle() -> Result<()> {
         let mut mailbox = Mailbox::new();
         mailbox.register_provider(Box::new(MemoryProvider::new()));
-        
+
         // 1. Test start
         mailbox.start().await?;
-        
+
         // 2. Test operations
         let to_address: Url = "mem:test/lifecycle".parse().unwrap();
         let mail = OutgoingMail {
@@ -367,14 +378,14 @@ mod tests {
             headers: HashMap::new(),
             meta: HashMap::new(),
         };
-        
+
         mailbox.post(mail).await?;
         let status = mailbox.status(to_address.clone()).await?;
         assert_eq!(status.unread_count, Some(1));
-        
+
         // 3. Test stop
         mailbox.stop().await?;
-        
+
         Ok(())
     }
 
@@ -443,10 +454,17 @@ mod tests {
             _address: Url,
             _callback: SubscriptionHandler,
         ) -> Result<Box<dyn Subscription>> {
-            Err(MailboxError::unsupported_capability(self.protocol(), "subscriptions"))
+            Err(MailboxError::unsupported_capability(
+                self.protocol(),
+                "subscriptions",
+            ))
         }
 
-        async fn fetch(&self, _address: Url, options: FetchOptions) -> Result<Option<AckableMessage>> {
+        async fn fetch(
+            &self,
+            _address: Url,
+            options: FetchOptions,
+        ) -> Result<Option<AckableMessage>> {
             crate::provider::reject_peek_in_fetch(&options)?;
             let message = {
                 let mut sent = self.sent.lock().unwrap();
@@ -514,10 +532,17 @@ mod tests {
             _address: Url,
             _callback: SubscriptionHandler,
         ) -> Result<Box<dyn Subscription>> {
-            Err(MailboxError::unsupported_capability(self.protocol(), "subscriptions"))
+            Err(MailboxError::unsupported_capability(
+                self.protocol(),
+                "subscriptions",
+            ))
         }
 
-        async fn fetch(&self, address: Url, options: FetchOptions) -> Result<Option<AckableMessage>> {
+        async fn fetch(
+            &self,
+            address: Url,
+            options: FetchOptions,
+        ) -> Result<Option<AckableMessage>> {
             crate::provider::reject_peek_in_fetch(&options)?;
             let topic = Self::topic_of(&address);
             let message = {
@@ -542,7 +567,10 @@ mod tests {
 
             // manual_ack：离开队列但没结算完，`status` 里必须看得见。
             let id = message.id.clone();
-            self.in_flight.lock().unwrap().push((topic, message.clone()));
+            self.in_flight
+                .lock()
+                .unwrap()
+                .push((topic, message.clone()));
             let in_flight_for_ack = self.in_flight.clone();
             let in_flight_for_nack = self.in_flight.clone();
             let queued_for_nack = self.queued.clone();
@@ -649,7 +677,9 @@ mod tests {
     async fn test_status_reports_unknown_for_an_address_that_was_never_touched() -> Result<()> {
         let mailbox = mailbox_with(Box::new(MemoryProvider::new()));
 
-        let status = mailbox.status("mem:rust-mailbox/never-touched".parse()?).await?;
+        let status = mailbox
+            .status("mem:rust-mailbox/never-touched".parse()?)
+            .await?;
         assert_eq!(status.state, "unknown");
         assert_eq!(status.exists, Some(false));
         assert_eq!(status.unread_count, Some(0));
@@ -667,7 +697,9 @@ mod tests {
         // 问不到 ≠ 不存在：`exists` 必须留空，不是 `Some(false)`。
         let mailbox = mailbox_with(Box::new(remote("nostatus")));
 
-        let status = mailbox.status("nostatus:x@example.com/inbox".parse()?).await?;
+        let status = mailbox
+            .status("nostatus:x@example.com/inbox".parse()?)
+            .await?;
         assert_eq!(status.state, "unknown");
         assert_eq!(status.exists, None);
         assert_eq!(
@@ -682,12 +714,27 @@ mod tests {
         let mailbox = mailbox_with(Box::new(MemoryProvider::new()));
         let address: Url = "mem:rust-mailbox/peek-basic".parse()?;
 
-        mailbox.post(mail("mem:rust-mailbox/sender", address.as_str(), json!({ "n": 1 }))).await?;
-        mailbox.post(mail("mem:rust-mailbox/sender", address.as_str(), json!({ "n": 2 }))).await?;
+        mailbox
+            .post(mail(
+                "mem:rust-mailbox/sender",
+                address.as_str(),
+                json!({ "n": 1 }),
+            ))
+            .await?;
+        mailbox
+            .post(mail(
+                "mem:rust-mailbox/sender",
+                address.as_str(),
+                json!({ "n": 2 }),
+            ))
+            .await?;
 
         let snapshot = mailbox.peek(address.clone(), None).await?;
         assert_eq!(
-            snapshot.iter().map(|m| m.body["n"].as_i64().unwrap()).collect::<Vec<_>>(),
+            snapshot
+                .iter()
+                .map(|m| m.body["n"].as_i64().unwrap())
+                .collect::<Vec<_>>(),
             vec![1, 2]
         );
 
@@ -698,7 +745,12 @@ mod tests {
         // limit 只取头部；取走还是走 fetch。
         assert_eq!(mailbox.peek(address.clone(), Some(1)).await?.len(), 1);
         assert_eq!(
-            mailbox.fetch(address.clone(), FetchOptions::default()).await?.unwrap().message.body,
+            mailbox
+                .fetch(address.clone(), FetchOptions::default())
+                .await?
+                .unwrap()
+                .message
+                .body,
             json!({ "n": 1 })
         );
         Ok(())
@@ -707,18 +759,28 @@ mod tests {
     #[tokio::test]
     async fn test_unknown_address_peek_is_an_empty_vec() -> Result<()> {
         let mailbox = mailbox_with(Box::new(MemoryProvider::new()));
-        assert!(mailbox.peek("mem:rust-mailbox/peek-empty".parse()?, None).await?.is_empty());
+        assert!(mailbox
+            .peek("mem:rust-mailbox/peek-empty".parse()?, None)
+            .await?
+            .is_empty());
         Ok(())
     }
 
     #[tokio::test]
-    async fn test_peek_on_a_transport_without_the_capability_raises_and_keeps_the_message() -> Result<()> {
+    async fn test_peek_on_a_transport_without_the_capability_raises_and_keeps_the_message(
+    ) -> Result<()> {
         let broker = remote("nostatus");
         let sent = broker.sent.clone();
         let mailbox = mailbox_with(Box::new(broker));
         let address: Url = "nostatus:b@example.com/inbox".parse()?;
 
-        mailbox.post(mail("nostatus:a@example.com/u", address.as_str(), json!({ "n": 1 }))).await?;
+        mailbox
+            .post(mail(
+                "nostatus:a@example.com/u",
+                address.as_str(),
+                json!({ "n": 1 }),
+            ))
+            .await?;
 
         let error = expect_err(mailbox.peek(address.clone(), None).await);
         assert_eq!(error.code(), Some("MBX_UNSUPPORTED_CAPABILITY"));
@@ -731,20 +793,40 @@ mod tests {
         // Rust 端取信与只读快照是两个方法（返回类型不同）；`fetch` 里给 `peek` 必须报错。
         let mailbox = mailbox_with(Box::new(MemoryProvider::new()));
         let address: Url = "mem:rust-mailbox/peek-in-fetch".parse()?;
-        mailbox.post(mail("mem:rust-mailbox/sender", address.as_str(), json!({ "n": 1 }))).await?;
+        mailbox
+            .post(mail(
+                "mem:rust-mailbox/sender",
+                address.as_str(),
+                json!({ "n": 1 }),
+            ))
+            .await?;
 
-        let contradictory = expect_err(mailbox
-            .fetch(
-                address.clone(),
-                FetchOptions { peek: true, manual_ack: true, ..Default::default() },
-            )
-            .await);
+        let contradictory = expect_err(
+            mailbox
+                .fetch(
+                    address.clone(),
+                    FetchOptions {
+                        peek: true,
+                        manual_ack: true,
+                        ..Default::default()
+                    },
+                )
+                .await,
+        );
         assert_eq!(contradictory.code(), Some("MBX_INVALID_FETCH_OPTIONS"));
         assert!(contradictory.to_string().contains("contradictory"));
 
-        let routed = expect_err(mailbox
-            .fetch(address.clone(), FetchOptions { peek: true, ..Default::default() })
-            .await);
+        let routed = expect_err(
+            mailbox
+                .fetch(
+                    address.clone(),
+                    FetchOptions {
+                        peek: true,
+                        ..Default::default()
+                    },
+                )
+                .await,
+        );
         assert_eq!(routed.code(), Some("MBX_INVALID_FETCH_OPTIONS"));
         assert!(routed.to_string().contains("Mailbox::peek"));
 
@@ -762,19 +844,35 @@ mod tests {
 
         let error = expect_err(
             mailbox
-                .post(mail("mem:rust-mailbox/u", with_query.as_str(), json!({ "n": 2 })))
+                .post(mail(
+                    "mem:rust-mailbox/u",
+                    with_query.as_str(),
+                    json!({ "n": 2 }),
+                ))
                 .await,
         );
         assert_eq!(error.code(), Some("MBX_INVALID_ADDRESS"));
         // 错误信息要能指出「会跟谁合并」。
         let message = error.to_string();
-        assert!(message.contains("mem:rust-mailbox/entry-rules?thread=1"), "{}", message);
-        assert!(message.contains("mem://rust-mailbox/entry-rules"), "{}", message);
+        assert!(
+            message.contains("mem:rust-mailbox/entry-rules?thread=1"),
+            "{}",
+            message
+        );
+        assert!(
+            message.contains("mem://rust-mailbox/entry-rules"),
+            "{}",
+            message
+        );
         assert!(message.contains("in post()"), "{}", message);
 
         // from 端受同一套规则约束。
         assert!(mailbox
-            .post(mail("mem:rust-mailbox/u?route=direct", "mem:rust-mailbox/entry-rules", json!({})))
+            .post(mail(
+                "mem:rust-mailbox/u?route=direct",
+                "mem:rust-mailbox/entry-rules",
+                json!({})
+            ))
             .await
             .is_err());
 
@@ -788,7 +886,12 @@ mod tests {
             Some("MBX_INVALID_ADDRESS")
         );
         assert_eq!(
-            expect_err(mailbox.fetch(with_hash.clone(), FetchOptions::default()).await).code(),
+            expect_err(
+                mailbox
+                    .fetch(with_hash.clone(), FetchOptions::default())
+                    .await
+            )
+            .code(),
             Some("MBX_INVALID_ADDRESS")
         );
         assert_eq!(
@@ -801,7 +904,9 @@ mod tests {
         );
 
         // 旧行为：这些入口会把带 query / hash 的地址当成裸地址，痕迹全落在裸地址上。
-        let bare = mailbox.status("mem:rust-mailbox/entry-rules".parse()?).await?;
+        let bare = mailbox
+            .status("mem:rust-mailbox/entry-rules".parse()?)
+            .await?;
         assert_eq!(bare.exists, Some(false));
         assert_eq!(bare.unread_count, Some(0));
         assert_eq!(bare.extra["subscriber_count"], json!(0));
@@ -809,14 +914,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_snapshot_lists_every_topic_sorted_by_canonical_id_with_aggregates() -> Result<()> {
+    async fn test_snapshot_lists_every_topic_sorted_by_canonical_id_with_aggregates() -> Result<()>
+    {
         let mailbox = mailbox_with(Box::new(LocalQueueProvider::new()));
 
-        mailbox.post(mail("local:a@example.com/u", "local:b@example.com/queue-b", json!({ "n": 1 }))).await?;
-        mailbox.post(mail("local:a@example.com/u", "local:b@example.com/queue-b", json!({ "n": 2 }))).await?;
-        mailbox.post(mail("local:a@example.com/u", "local:a@example.com/queue-a", json!({ "n": 3 }))).await?;
         mailbox
-            .fetch("local:b@example.com/queue-b".parse()?, FetchOptions { manual_ack: true, ..Default::default() })
+            .post(mail(
+                "local:a@example.com/u",
+                "local:b@example.com/queue-b",
+                json!({ "n": 1 }),
+            ))
+            .await?;
+        mailbox
+            .post(mail(
+                "local:a@example.com/u",
+                "local:b@example.com/queue-b",
+                json!({ "n": 2 }),
+            ))
+            .await?;
+        mailbox
+            .post(mail(
+                "local:a@example.com/u",
+                "local:a@example.com/queue-a",
+                json!({ "n": 3 }),
+            ))
+            .await?;
+        mailbox
+            .fetch(
+                "local:b@example.com/queue-b".parse()?,
+                FetchOptions {
+                    manual_ack: true,
+                    ..Default::default()
+                },
+            )
             .await?;
 
         let snap = mailbox.snapshot().await?;
@@ -831,7 +961,10 @@ mod tests {
                 .iter()
                 .map(|e| e.canonical_id.as_str())
                 .collect::<Vec<_>>(),
-            vec!["local://a@example.com/queue-a", "local://b@example.com/queue-b"]
+            vec![
+                "local://a@example.com/queue-a",
+                "local://b@example.com/queue-b"
+            ]
         );
         assert_eq!(snap.addresses[0].protocol, "local");
         assert_eq!(snap.addresses[0].status.exists, Some(true));
@@ -864,14 +997,36 @@ mod tests {
         mailbox.register_provider(Box::new(LocalQueueProvider::new()));
         mailbox.register_provider(Box::new(remote("aaa-remote")));
 
-        mailbox.post(mail("local:a@example.com/u", "local:snap-visible@example.com/inbox", json!({}))).await?;
-        mailbox.post(mail("aaa-remote:a@example.com/u", "aaa-remote:snap-hidden@example.com/inbox", json!({}))).await?;
-        mailbox.post(mail("zzz-remote:a@example.com/u", "zzz-remote:snap-hidden@example.com/inbox", json!({}))).await?;
+        mailbox
+            .post(mail(
+                "local:a@example.com/u",
+                "local:snap-visible@example.com/inbox",
+                json!({}),
+            ))
+            .await?;
+        mailbox
+            .post(mail(
+                "aaa-remote:a@example.com/u",
+                "aaa-remote:snap-hidden@example.com/inbox",
+                json!({}),
+            ))
+            .await?;
+        mailbox
+            .post(mail(
+                "zzz-remote:a@example.com/u",
+                "zzz-remote:snap-hidden@example.com/inbox",
+                json!({}),
+            ))
+            .await?;
 
         let snap = mailbox.snapshot().await?;
         assert_eq!(
             snap.protocols,
-            vec!["aaa-remote".to_string(), "local".to_string(), "zzz-remote".to_string()]
+            vec![
+                "aaa-remote".to_string(),
+                "local".to_string(),
+                "zzz-remote".to_string()
+            ]
         );
         assert_eq!(
             snap.unsupported_providers,
@@ -889,7 +1044,9 @@ mod tests {
     async fn test_every_snapshot_entry_can_be_queried_back_by_canonical_id() -> Result<()> {
         let mailbox = mailbox_with(Box::new(LocalQueueProvider::new()));
         let address = "local:roundtrip@example.com/inbox/thread-1";
-        mailbox.post(mail("local:a@example.com/u", address, json!({}))).await?;
+        mailbox
+            .post(mail("local:a@example.com/u", address, json!({})))
+            .await?;
 
         let entry = &mailbox.snapshot().await?.addresses[0];
         assert_eq!(
@@ -908,7 +1065,9 @@ mod tests {
         // `mem:` 总线在测试进程里是共享的，所以只看本次创建的地址（不用绝对计数）。
         let mailbox = mailbox_with(Box::new(MemoryProvider::new()));
         let kept = "mem:rust-mailbox/snapshot-mine/inbox";
-        mailbox.post(mail("mem:rust-mailbox/sender", kept, json!({ "n": 1 }))).await?;
+        mailbox
+            .post(mail("mem:rust-mailbox/sender", kept, json!({ "n": 1 })))
+            .await?;
 
         let snap = mailbox.snapshot().await?;
         assert_eq!(snap.protocols, vec!["mem".to_string()]);
@@ -934,7 +1093,11 @@ mod tests {
 
     /// 隔离用的唯一 scope（不弄脏进程级共享总线，也不被其它用例弄脏）。
     fn unique_scope(label: &str) -> String {
-        format!("rust-{}-{}", label, SCOPE_SEQ.fetch_add(1, Ordering::SeqCst))
+        format!(
+            "rust-{}-{}",
+            label,
+            SCOPE_SEQ.fetch_add(1, Ordering::SeqCst)
+        )
     }
 
     /// 轮询等待条件成立（订阅回调在 spawn 的任务里跑）。
@@ -970,10 +1133,17 @@ mod tests {
             _address: Url,
             _callback: SubscriptionHandler,
         ) -> Result<Box<dyn Subscription>> {
-            Err(MailboxError::unsupported_capability(self.protocol(), "subscriptions"))
+            Err(MailboxError::unsupported_capability(
+                self.protocol(),
+                "subscriptions",
+            ))
         }
 
-        async fn fetch(&self, _address: Url, options: FetchOptions) -> Result<Option<AckableMessage>> {
+        async fn fetch(
+            &self,
+            _address: Url,
+            options: FetchOptions,
+        ) -> Result<Option<AckableMessage>> {
             crate::provider::reject_peek_in_fetch(&options)?;
             let message = self.queued.lock().unwrap().remove(0);
             Ok(Some(AckableMessage {
@@ -1009,8 +1179,16 @@ mod tests {
         }));
         mailbox.register_provider(Box::new(broker));
 
-        mailbox.post(mail("counter:a/u", "counter:box/inbox", json!({ "n": 1 }))).await?;
-        mailbox.post(mail("nostatus:a/u", "nostatus:box/inbox", json!({ "n": 1 }))).await?;
+        mailbox
+            .post(mail("counter:a/u", "counter:box/inbox", json!({ "n": 1 })))
+            .await?;
+        mailbox
+            .post(mail(
+                "nostatus:a/u",
+                "nostatus:box/inbox",
+                json!({ "n": 1 }),
+            ))
+            .await?;
 
         mailbox.clear().await?;
 
@@ -1023,12 +1201,21 @@ mod tests {
     #[tokio::test]
     async fn test_clear_is_idempotent_and_fine_without_any_provider() -> Result<()> {
         let mailbox = mailbox_with(Box::new(MemoryProvider::create_isolated(None)));
-        mailbox.post(mail("mem:rust-clear/sender", "mem:rust-clear/idempotent", json!({}))).await?;
+        mailbox
+            .post(mail(
+                "mem:rust-clear/sender",
+                "mem:rust-clear/idempotent",
+                json!({}),
+            ))
+            .await?;
 
         mailbox.clear().await?;
         mailbox.clear().await?; // 重复调不报错
         assert_eq!(
-            mailbox.status("mem:rust-clear/idempotent".parse()?).await?.unread_count,
+            mailbox
+                .status("mem:rust-clear/idempotent".parse()?)
+                .await?
+                .unread_count,
             Some(0)
         );
 
@@ -1045,29 +1232,47 @@ mod tests {
         let live: Url = "mem:rust-clear/keep-sub-live".parse()?;
 
         let hits = Arc::new(AtomicUsize::new(0));
-        let mut sub = mailbox.subscribe(live.clone(), {
-            let hits = hits.clone();
-            Box::new(move |_message| {
+        let mut sub = mailbox
+            .subscribe(live.clone(), {
                 let hits = hits.clone();
-                Box::pin(async move {
-                    hits.fetch_add(1, Ordering::SeqCst);
-                    Ok(())
+                Box::new(move |_message| {
+                    let hits = hits.clone();
+                    Box::pin(async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    })
                 })
             })
-        }).await?;
+            .await?;
 
-        mailbox.post(mail("mem:rust-clear/sender", queued.as_str(), json!({ "n": 1 }))).await?;
+        mailbox
+            .post(mail(
+                "mem:rust-clear/sender",
+                queued.as_str(),
+                json!({ "n": 1 }),
+            ))
+            .await?;
         assert_eq!(mailbox.status(queued.clone()).await?.unread_count, Some(1));
 
         mailbox.clear().await?;
         assert_eq!(mailbox.status(queued.clone()).await?.unread_count, Some(0));
         assert_eq!(sub.status(), SubscriptionStatus::Active);
 
-        mailbox.post(mail("mem:rust-clear/sender", live.as_str(), json!({ "n": 2 }))).await?;
-        assert!(wait_until(|| {
-            let hits = hits.clone();
-            async move { hits.load(Ordering::SeqCst) >= 1 }
-        }).await, "清理之后旧订阅者必须照常收到新消息");
+        mailbox
+            .post(mail(
+                "mem:rust-clear/sender",
+                live.as_str(),
+                json!({ "n": 2 }),
+            ))
+            .await?;
+        assert!(
+            wait_until(|| {
+                let hits = hits.clone();
+                async move { hits.load(Ordering::SeqCst) >= 1 }
+            })
+            .await,
+            "清理之后旧订阅者必须照常收到新消息"
+        );
 
         sub.unsubscribe().await?;
         Ok(())
@@ -1083,7 +1288,9 @@ mod tests {
             let mut first = Mailbox::new();
             first.register_provider(Box::new(MemoryProvider::for_scope(&scope, None)));
             first.start().await?;
-            first.post(mail("mem:rust-stop/sender", addr, json!({ "n": 1 }))).await?;
+            first
+                .post(mail("mem:rust-stop/sender", addr, json!({ "n": 1 })))
+                .await?;
 
             if purge {
                 first.stop_and_purge().await?;
@@ -1106,14 +1313,30 @@ mod tests {
         let live = "mem:rust-purge/live";
         let queued = "mem:rust-purge/queue";
 
-        let sub = mailbox.subscribe(live.parse()?, Box::new(|_| Box::pin(async { Ok(()) }))).await?;
+        let sub = mailbox
+            .subscribe(live.parse()?, Box::new(|_| Box::pin(async { Ok(()) })))
+            .await?;
         // 有订阅者的地址：走广播，不入队。
-        mailbox.post(mail("mem:rust-purge/sender", live, json!({ "n": 0 }))).await?;
+        mailbox
+            .post(mail("mem:rust-purge/sender", live, json!({ "n": 0 })))
+            .await?;
         assert_eq!(mailbox.status(live.parse()?).await?.unread_count, Some(0));
 
-        mailbox.post(mail("mem:rust-purge/sender", queued, json!({ "n": 1 }))).await?;
-        mailbox.post(mail("mem:rust-purge/sender", queued, json!({ "n": 2 }))).await?;
-        let _taken = mailbox.fetch(queued.parse()?, FetchOptions { manual_ack: true, ..Default::default() }).await?;
+        mailbox
+            .post(mail("mem:rust-purge/sender", queued, json!({ "n": 1 })))
+            .await?;
+        mailbox
+            .post(mail("mem:rust-purge/sender", queued, json!({ "n": 2 })))
+            .await?;
+        let _taken = mailbox
+            .fetch(
+                queued.parse()?,
+                FetchOptions {
+                    manual_ack: true,
+                    ..Default::default()
+                },
+            )
+            .await?;
 
         let status = mailbox.status(queued.parse()?).await?;
         assert_eq!(status.unread_count, Some(1));
@@ -1137,7 +1360,13 @@ mod tests {
         let mailbox = mailbox_with(Box::new(broker));
         mailbox.start().await?;
 
-        mailbox.post(mail("nostatus:a/u", "nostatus:box/inbox", json!({ "n": 1 }))).await?;
+        mailbox
+            .post(mail(
+                "nostatus:a/u",
+                "nostatus:box/inbox",
+                json!({ "n": 1 }),
+            ))
+            .await?;
 
         mailbox.clear().await?;
         mailbox.stop_and_purge().await?;

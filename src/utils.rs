@@ -168,7 +168,10 @@ mod tests {
             canon("mem://bob@example.com:8080/inbox"),
             "mem://bob@example.com:8080/inbox"
         );
-        assert_eq!(canon("mem://bob:secret@example.com/inbox"), "mem://bob@example.com/inbox");
+        assert_eq!(
+            canon("mem://bob:secret@example.com/inbox"),
+            "mem://bob@example.com/inbox"
+        );
         assert_eq!(canon("mem:inbox"), "mem://inbox");
     }
 
@@ -183,7 +186,10 @@ mod tests {
 
     #[test]
     fn opaque_and_hierarchical_forms_land_on_the_same_topic() {
-        assert_eq!(canon("mem:alice@example.com/inbox"), canon("mem://alice@example.com/inbox"));
+        assert_eq!(
+            canon("mem:alice@example.com/inbox"),
+            canon("mem://alice@example.com/inbox")
+        );
     }
 
     #[test]
@@ -193,39 +199,58 @@ mod tests {
 
         // `Mailbox::snapshot()` 要靠 canonical id 复查地址。
         let reparsed = parse_mailbox_address(&once, "snapshot()").unwrap();
-        assert_eq!(get_canonical_mailbox_address_identifier(&reparsed).unwrap(), once);
+        assert_eq!(
+            get_canonical_mailbox_address_identifier(&reparsed).unwrap(),
+            once
+        );
     }
 
     #[test]
     fn query_is_rejected_instead_of_trimmed_off() {
-        let error = get_canonical_mailbox_address_identifier(&url("mem:q@example.com/inbox?thread=1"))
-            .unwrap_err();
+        let error =
+            get_canonical_mailbox_address_identifier(&url("mem:q@example.com/inbox?thread=1"))
+                .unwrap_err();
         assert!(
             matches!(error, MailboxError::InvalidMailboxAddress { .. }),
             "query 必须报错，不是被裁掉：{:?}",
             error
         );
-        assert!(error.to_string().contains("would be dropped by address canonicalization"));
+        assert!(error
+            .to_string()
+            .contains("would be dropped by address canonicalization"));
 
         // 塌缩的直接后果：query 版与裸地址版 canonical id 相同 —— 必须无法发生。
-        assert_eq!(canon("mem:q@example.com/inbox"), "mem://q@example.com/inbox");
+        assert_eq!(
+            canon("mem:q@example.com/inbox"),
+            "mem://q@example.com/inbox"
+        );
     }
 
     #[test]
     fn hash_is_rejected_and_the_message_names_the_dropped_part() {
-        let error = assert_lossless_mailbox_address(&url("mem:h@example.com/inbox#frag"), "status()")
-            .unwrap_err();
+        let error =
+            assert_lossless_mailbox_address(&url("mem:h@example.com/inbox#frag"), "status()")
+                .unwrap_err();
         let message = error.to_string();
-        assert!(message.contains("hash \"#frag\" would be dropped"), "{}", message);
+        assert!(
+            message.contains("hash \"#frag\" would be dropped"),
+            "{}",
+            message
+        );
         assert!(message.contains("in status()"), "{}", message);
     }
 
     #[test]
     fn query_and_hash_together_are_both_reported() {
-        let message = assert_lossless_mailbox_address(&url("mem:a@example.com/i?x=1#f"), "mailbox address")
-            .unwrap_err()
-            .to_string();
-        assert!(message.contains("query \"?x=1\" and hash \"#f\""), "{}", message);
+        let message =
+            assert_lossless_mailbox_address(&url("mem:a@example.com/i?x=1#f"), "mailbox address")
+                .unwrap_err()
+                .to_string();
+        assert!(
+            message.contains("query \"?x=1\" and hash \"#f\""),
+            "{}",
+            message
+        );
     }
 
     #[test]
@@ -244,8 +269,11 @@ mod tests {
     #[test]
     fn percent_encoded_markers_are_path_content_and_stay_legal() {
         // `%3F` / `%23` 是 path 的内容，不是分隔符：合法，且原样留在 canonical id 里。
-        assert_lossless_mailbox_address(&url("mem:a@example.com/inbox%3Fthread%3D1%23frag"), "post()")
-            .unwrap();
+        assert_lossless_mailbox_address(
+            &url("mem:a@example.com/inbox%3Fthread%3D1%23frag"),
+            "post()",
+        )
+        .unwrap();
         assert_eq!(
             canon("mem:a@example.com/inbox%3Fthread%3D1"),
             "mem://a@example.com/inbox%3Fthread%3D1"
@@ -254,7 +282,8 @@ mod tests {
 
     #[test]
     fn error_carries_the_address_and_a_stable_code() {
-        let error = parse_mailbox_address("mem:q@example.com/inbox?thread=1", "post()").unwrap_err();
+        let error =
+            parse_mailbox_address("mem:q@example.com/inbox?thread=1", "post()").unwrap_err();
         match &error {
             MailboxError::InvalidMailboxAddress { address, .. } => {
                 assert_eq!(address, "mem:q@example.com/inbox?thread=1");
@@ -265,7 +294,11 @@ mod tests {
 
         // 错误信息要能指出「会跟谁合并」，否则调用方看不懂自己撞了哪条队列。
         let message = error.to_string();
-        assert!(message.contains("mem:q@example.com/inbox?thread=1"), "{}", message);
+        assert!(
+            message.contains("mem:q@example.com/inbox?thread=1"),
+            "{}",
+            message
+        );
         assert!(message.contains("mem://q@example.com/inbox"), "{}", message);
         assert!(message.contains("in post()"), "{}", message);
     }

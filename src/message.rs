@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use url::Url;
 use std::collections::HashMap;
+use url::Url;
 
 // We need to import Identifiable trait if we want to implement it here?
 // Or we can just implement it in providers/queue.rs if we import MailMessage there?
