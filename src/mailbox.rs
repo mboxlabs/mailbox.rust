@@ -33,11 +33,7 @@ impl Mailbox {
      * @param raise_error_if_failed 如果为 true，且找不到 Provider 时返回错误。
      */
     pub fn get_provider(&self, protocol: &str, raise_error_if_failed: bool) -> Result<Option<Arc<dyn MailboxProvider>>> {
-        let key = if protocol.ends_with(':') {
-            &protocol[..protocol.len() - 1]
-        } else {
-            protocol
-        };
+        let key = protocol.strip_suffix(':').unwrap_or(protocol);
 
         match self.providers.get(key) {
             Some(p) => Ok(Some(p.clone())),
@@ -52,11 +48,7 @@ impl Mailbox {
     }
 
     fn get_provider_or_fail(&self, protocol: &str) -> Result<Arc<dyn MailboxProvider>> {
-        let key = if protocol.ends_with(':') {
-            &protocol[..protocol.len() - 1]
-        } else {
-            protocol
-        };
+        let key = protocol.strip_suffix(':').unwrap_or(protocol);
 
         self.providers
             .get(key)

@@ -139,7 +139,7 @@ pub struct MailboxSnapshot {
     pub taken_at: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct FetchOptions {
     pub manual_ack: bool,
     /**
@@ -156,15 +156,4 @@ pub struct FetchOptions {
     pub peek: bool,
     /// `peek` 最多看几条；`None` = 整个队列。必须是**非负**整数（Rust 的 `usize` 已在编译期保证）。
     pub limit: Option<usize>,
-}
-
-impl Default for FetchOptions {
-    fn default() -> Self {
-        Self {
-            manual_ack: false,
-            ack_timeout: None,
-            peek: false,
-            limit: None,
-        }
-    }
 }

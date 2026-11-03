@@ -705,7 +705,6 @@ impl ProviderCore {
         #[cfg(target_arch = "wasm32")]
         {
             let _ = key;
-            return;
         }
         #[cfg(not(target_arch = "wasm32"))]
         {

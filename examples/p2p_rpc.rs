@@ -27,7 +27,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 None => return Err(MailboxError::Retriable("missing args".to_string())),
             };
             let op = msg.body["op"].as_str().unwrap_or("");
-            let a = args.get(0).and_then(|v| v.as_i64()).unwrap_or(0);
+            let a = args.first().and_then(|v| v.as_i64()).unwrap_or(0);
             let b = args.get(1).and_then(|v| v.as_i64()).unwrap_or(0);
 
             let result = match op {

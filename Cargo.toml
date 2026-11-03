@@ -1,6 +1,6 @@
 [package]
 name = "mboxlabs-mailbox"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 authors = ["MboxLabs Team"]
 license = "MIT"
@@ -21,8 +21,6 @@ url = { version = "2", features = ["serde"] }
 thiserror = "2"
 uuid = { version = "1", features = ["v4", "js"] }
 async-trait = "0.1"
-dashmap = "6"
-wasm-bindgen = "0.2"
 futures = "0.3"
 chrono = { version = "0.4", features = ["serde"] }
 once_cell = "1.21"
@@ -35,4 +33,6 @@ tokio = { version = "1", features = ["sync", "macros"] }
 wasm-bindgen-futures = "0.4"
 
 [dev-dependencies]
-tokio-test = "0.4"
+# 测试所需的 tokio 特性（rt / time）原先是由 `tokio-test` 间接带入的；移除后显式补齐，
+# 否则 wasm32 目标下（主依赖只有 sync + macros）`#[tokio::test]` 编不过。
+tokio = { version = "1", features = ["rt", "macros", "time"] }

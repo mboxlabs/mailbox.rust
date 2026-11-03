@@ -32,6 +32,14 @@ pub struct MailMessageQueue<T> {
     in_flight: HashMap<String, InFlightMessage<T>>,
 }
 
+impl<T> Default for MailMessageQueue<T>
+where T: Clone + Identifiable
+{
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<T> MailMessageQueue<T>
 where T: Clone + Identifiable
 {
@@ -45,7 +53,7 @@ where T: Clone + Identifiable
     pub fn enqueue(&mut self, topic: String, message: T) {
         self.queues
             .entry(topic)
-            .or_insert_with(VecDeque::new)
+            .or_default()
             .push_back(message);
     }
 
@@ -171,7 +179,7 @@ where T: Clone + Identifiable
         }
         self.queues
             .entry(topic)
-            .or_insert_with(VecDeque::new)
+            .or_default()
             .push_front(message);
         true
     }
