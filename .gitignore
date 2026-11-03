@@ -2,9 +2,9 @@
 /target/
 **/*.rs.bk
 
-# Cargo lock file (for libraries, don't commit)
-# For applications, you should commit Cargo.lock
-Cargo.lock
+# Cargo.lock 是有意提交的（虽然这是个库 crate）：它不锁定下游的依赖解析，
+# 但能让 CI、`cargo package` 的 verify 和 docs.rs 构建可复现，并且让 MSRV
+# 破坏在提交时就暴露，而不是下一次无关的 `cargo update` 里。注意 lock v4 需要 cargo >= 1.78。
 
 # WASM build outputs
 /pkg/

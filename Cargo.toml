@@ -2,6 +2,9 @@
 name = "mboxlabs-mailbox"
 version = "0.2.0"
 edition = "2021"
+# 当前依赖图里要求最高的 MSRV：uuid 1.29 要 1.89（tokio 1.54 要 1.85）。
+# 不声明的话，旧工具链只会看到一堆看不懂的编译错误，而不是清晰的版本提示。
+rust-version = "1.89"
 authors = ["MboxLabs Team"]
 license = "MIT"
 description = "A lightweight, pluggable mailbox/queue kernel inspired by the Erlang Actor Model"
@@ -23,7 +26,6 @@ uuid = { version = "1", features = ["v4", "js"] }
 async-trait = "0.1"
 futures = "0.3"
 chrono = { version = "0.4", features = ["serde"] }
-once_cell = "1.21"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio = { version = "1", features = ["full"] }

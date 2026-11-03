@@ -11,9 +11,8 @@ use crate::utils::{get_canonical_mailbox_address_identifier, normalize_peek_limi
 
 use async_trait::async_trait;
 use futures::future::BoxFuture;
-use once_cell::sync::Lazy;
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, LazyLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::Duration;
 use url::Url;
 use uuid::Uuid;
@@ -38,8 +37,8 @@ struct BusState {
 ///
 /// 注册表不会自动回收：动态生成的 scope 名（带时间戳、每次新建）会一直占着那份状态。
 /// 需要「用完就丢」的场景用私有总线（[`MemoryEventBus::new`] / [`MemoryProvider::create_isolated`]）。
-static SCOPES: Lazy<RwLock<HashMap<String, MemoryEventBus>>> =
-    Lazy::new(|| RwLock::new(HashMap::new()));
+static SCOPES: LazyLock<RwLock<HashMap<String, MemoryEventBus>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
 
 /// 模拟消息传递的内存总线（一个「服务端」）：每个实例持有一份 topic 队列 + 订阅表。
 ///
