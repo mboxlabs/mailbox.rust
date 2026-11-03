@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use futures::future::BoxFuture;
 use once_cell::sync::Lazy;
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::Duration;
 use url::Url;
 use uuid::Uuid;
@@ -21,113 +21,287 @@ use uuid::Uuid;
 /// 总线上的监听器 = core 的投递入口：返回本次投递的**最终结算**（含整条重试链）。
 type Listener = dyn Fn(MailMessage) -> BoxFuture<'static, DeliveryResult> + Send + Sync;
 
-struct MemoryEventBus {
+/// 默认 scope 的名字：进程级共享的那一份总线（与 TS / Python 的 `DEFAULT_MEMORY_SCOPE` 同名）。
+pub const DEFAULT_MEMORY_SCOPE: &str = "";
+
+/// 总线的真实状态：一份 topic 订阅表 + 一份队列 + 一份活动时间。
+///
+/// 它不直接暴露：[`MemoryEventBus`] 是持有它的句柄（`Arc`），克隆句柄即共享同一份状态 ——
+/// 对应 JS 里把同一个 bus 对象传给多个 provider。
+struct BusState {
     topics: HashMap<String, Vec<Arc<Listener>>>,
     queue: MailMessageQueue<MailMessage>,
     last_activity: HashMap<String, String>,
 }
 
+/// 按 scope 登记的总线；`DEFAULT_MEMORY_SCOPE` 就是历史上那个进程级单例。
+///
+/// 注册表不会自动回收：动态生成的 scope 名（带时间戳、每次新建）会一直占着那份状态。
+/// 需要「用完就丢」的场景用私有总线（[`MemoryEventBus::new`] / [`MemoryProvider::create_isolated`]）。
+static SCOPES: Lazy<RwLock<HashMap<String, MemoryEventBus>>> = Lazy::new(|| RwLock::new(HashMap::new()));
+
+/// 模拟消息传递的内存总线（一个「服务端」）：每个实例持有一份 topic 队列 + 订阅表。
+///
+/// 实例边界（issue#3，三端同一套语义）：
+/// - [`MemoryEventBus::new`] —— 私有总线，只属于持有它的 `MemoryProvider`。需要「每个 Mailbox
+///   一套互不相干的 `mem:` 状态」（宿主 + 插件、kernel + provider、不得互相串台的测试）就用这个。
+/// - [`MemoryEventBus::get_instance`] —— 按 scope 共享的进程级总线；`get_instance(None)` 就是历史
+///   上那个全局单例（保持现有「模拟服务端」用法不变）。
+///
+/// 注意：隔离靠「换 bus 实例」，不靠「换地址」—— `mem:` 地址空间在同一份 bus 内是全局的，没有
+/// 租户前缀，跨实例串台就是同一份 bus 上 topic 同名。
+#[derive(Clone)]
+pub struct MemoryEventBus {
+    scope: String,
+    state: Arc<RwLock<BusState>>,
+}
+
+impl Default for MemoryEventBus {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// 状态里存的是监听器（`dyn Fn`），打不出来；诊断只需要知道「是哪一份总线」。
+impl std::fmt::Debug for MemoryEventBus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MemoryEventBus")
+            .field("scope", &self.scope)
+            .field("shared", &Arc::as_ptr(&self.state))
+            .finish()
+    }
+}
+
+/// 「同一个 bus」= 同一份状态，不是字段相等：两份独立总线的字段可能一模一样，但它们互不相通。
+impl PartialEq for MemoryEventBus {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.state, &other.state)
+    }
+}
+
+impl Eq for MemoryEventBus {}
+
+/// `status()` 的一份总线读数：一次读锁里取齐，避免 unread / in-flight 来自两个时刻。
+struct BusTopicFacts {
+    unread_count: usize,
+    in_flight_count: usize,
+    subscriber_count: usize,
+    last_activity_time: Option<String>,
+}
+
 impl MemoryEventBus {
-    fn new() -> Self {
+    /// 私有总线：不登记进 scope 注册表，除了持有者没人看得见它的队列与订阅。
+    pub fn new() -> Self {
+        Self::with_scope(DEFAULT_MEMORY_SCOPE)
+    }
+
+    /// 私有总线，但带个 scope 名。仅用于诊断（`status()` / 日志里能看出这份状态是谁的）。
+    pub fn with_scope(scope: impl Into<String>) -> Self {
         Self {
-            topics: HashMap::new(),
-            queue: MailMessageQueue::new(),
-            last_activity: HashMap::new(),
+            scope: scope.into(),
+            state: Arc::new(RwLock::new(BusState {
+                topics: HashMap::new(),
+                queue: MailMessageQueue::new(),
+                last_activity: HashMap::new(),
+            })),
         }
     }
-}
 
-// Singleton instance using once_cell
-static BUS: Lazy<Arc<RwLock<MemoryEventBus>>> = Lazy::new(|| Arc::new(RwLock::new(MemoryEventBus::new())));
-
-fn touch(topic: &str) {
-    BUS.write()
-        .unwrap()
-        .last_activity
-        .insert(topic.to_string(), chrono::Utc::now().to_rfc3339());
-}
-
-/// 【只读】取一份队列快照（副本），不出队、不建 in-flight、不刷活动时间。
-///
-/// 注意：这里**不**写 `last_activity`。只读诊断不该把一个空闲地址刷成“刚刚有活动”，
-/// 否则一个每隔几秒轮询一次的诊断页会让 `last_activity_time` 永远假绿。
-fn peek(topic: &str, limit: Option<usize>) -> Vec<MailMessage> {
-    BUS.read().unwrap().queue.peek(topic, limit)
-}
-
-/// 这份总线认不认这个 topic：有过订阅、有过活动记录，或现在 / 曾有未结算的消息。
-///
-/// 这是 `status().exists` 的依据。“地址不存在”与“地址空闲但确实存在”在诊断上是两件事
-/// （issue#4）：前者 `exists: false` / `state: "unknown"`，后者 `exists: true` / `state: "online"`。
-fn knows(bus: &MemoryEventBus, topic: &str) -> bool {
-    bus.topics.contains_key(topic)
-        || bus.last_activity.contains_key(topic)
-        || bus.queue.has_topic(topic)
-}
-
-/// 这份总线上所有“认得”的 topic（订阅过 / 有过活动 / 有消息），按字典序排序。
-/// 供 [`crate::Mailbox::snapshot`]（不传地址的 `status()`）做全量快照。
-fn list_topics() -> Vec<String> {
-    let bus = BUS.read().unwrap();
-    let mut known: HashSet<&str> = HashSet::new();
-    for topic in bus.topics.keys() {
-        known.insert(topic.as_str());
-    }
-    for topic in bus.last_activity.keys() {
-        known.insert(topic.as_str());
+    /// 取（或创建）某个 scope 的共享总线。`scope = None` = 历史行为：进程级唯一单例。
+    ///
+    /// @param scope 命名空间标识；同 scope 拿到同一份队列与订阅表，不同 scope 互不可见。
+    pub fn get_instance(scope: Option<&str>) -> Self {
+        let scope = scope.unwrap_or(DEFAULT_MEMORY_SCOPE);
+        let mut scopes = SCOPES.write().unwrap();
+        if let Some(bus) = scopes.get(scope) {
+            return bus.clone();
+        }
+        let bus = Self::with_scope(scope);
+        scopes.insert(scope.to_string(), bus.clone());
+        bus
     }
 
-    let mut topics: Vec<String> = known.into_iter().map(str::to_string).collect();
-    topics.extend(bus.queue.topics());
-    topics.sort();
-    topics.dedup();
-    topics
-}
+    /// 这份状态属于哪个 scope（[`DEFAULT_MEMORY_SCOPE`] = 进程级共享那份）。
+    pub fn scope(&self) -> &str {
+        &self.scope
+    }
 
-/// 发布一条消息：有订阅者时交给订阅回调，否则入队等待 fetch 取回。
-///
-/// 返回广播时每次投递的结算 future（供发送侧做结算判定，见 `_send`）；入队时返回 `None`。
-/// 注意广播仍是 fire-and-forget：这里不等待，`post()` 也不会等订阅回调跑完。
-fn publish(topic: &str, message: MailMessage) -> Option<Vec<BoxFuture<'static, DeliveryResult>>> {
-    // 先 clone 出来再释放对 bus 的借用：监听器（core）会去拿自己的锁，绝不能持着 bus 的锁调它。
-    let listeners = {
-        let mut bus = BUS.write().unwrap();
+    /// 丢弃队列里的消息（含 in-flight）并抹掉对应的活动时间；`topic = None` 则清全部。
+    ///
+    /// **不动订阅表**：订阅是消费者主动建立的意图，拆它的是 `unsubscribe()` / `close()`。在
+    /// `clear()` 里顺手拆订阅，会让 provider 侧的 `Subscription` 对象变成「报 active 但再也收不到
+    /// 消息」的僵尸（issue#3）。需要拆订阅就关掉持有它的 `Mailbox` / provider。
+    ///
+    /// @param topic 只清这个 topic；`None` 则清空整份总线状态。
+    /// @returns 被丢弃的消息数（含 in-flight），便于诊断与断言。
+    pub fn clear(&self, topic: Option<&str>) -> usize {
+        let mut bus = self.write();
+        let dropped = bus.queue.clear(topic);
+        match topic {
+            None => bus.last_activity.clear(),
+            Some(topic) => {
+                bus.last_activity.remove(topic);
+            }
+        }
+        dropped
+    }
+
+    fn read(&self) -> RwLockReadGuard<'_, BusState> {
+        self.state.read().unwrap()
+    }
+
+    fn write(&self) -> RwLockWriteGuard<'_, BusState> {
+        self.state.write().unwrap()
+    }
+
+    /// 记一次消息活动（发送 / 取回）。只读的 `status()` / `peek()` **不**调它（issue#4）。
+    fn touch(&self, topic: &str) {
+        self.write()
+            .last_activity
+            .insert(topic.to_string(), chrono::Utc::now().to_rfc3339());
+    }
+
+    /// 这份总线认不认这个 topic：有过订阅、有过活动记录，或现在 / 曾有未结算的消息。
+    ///
+    /// 这是 `status().exists` 的依据。「地址不存在」与「地址空闲但确实存在」在诊断上是两件事
+    /// （issue#4）：前者 `exists: false` / `state: "unknown"`，后者 `exists: true` / `state: "online"`。
+    fn knows(&self, topic: &str) -> bool {
+        let bus = self.read();
+        bus.topics.contains_key(topic)
+            || bus.last_activity.contains_key(topic)
+            || bus.queue.has_topic(topic)
+    }
+
+    /// 这份总线上所有「认得」的 topic（订阅过 / 有过活动 / 有消息），按字典序排序。
+    /// 供 [`crate::Mailbox::snapshot`]（不传地址的 `status()`）做全量快照。
+    fn list_topics(&self) -> Vec<String> {
+        let bus = self.read();
+        let mut known: HashSet<&str> = HashSet::new();
+        for topic in bus.topics.keys() {
+            known.insert(topic.as_str());
+        }
+        for topic in bus.last_activity.keys() {
+            known.insert(topic.as_str());
+        }
+
+        let mut topics: Vec<String> = known.into_iter().map(str::to_string).collect();
+        topics.extend(bus.queue.topics());
+        topics.sort();
+        topics.dedup();
+        topics
+    }
+
+    /// 挂一个订阅者（同时记一次活动：有人开始用这个地址了）。
+    fn add_listener(&self, topic: &str, listener: Arc<Listener>) {
+        let mut bus = self.write();
+        bus.topics
+            .entry(topic.to_string())
+            .or_default()
+            .push(listener);
         bus.last_activity
             .insert(topic.to_string(), chrono::Utc::now().to_rfc3339());
-        bus.topics.get(topic).cloned().unwrap_or_default()
-    };
-
-    if listeners.is_empty() {
-        // 入队，等待 fetch 取回
-        BUS.write()
-            .unwrap()
-            .queue
-            .enqueue(topic.to_string(), message);
-        return None;
     }
 
-    // 一条消息只走一条路：有订阅者就只走订阅。
-    // 两条路都走时，订阅者从不 fetch → 队列只涨不消；退订后一次 fetch 又会把已处理过的
-    // 消息再投递一遍（副作用执行两次）。必须判空：退订后 topics[topic] 仍存在（空 Vec）。
-    //
-    // 每次投递的结算要留一份给发送侧：部分失败时「整条消息回不回队」必须等全部投递结算后
-    // 才能判断，不能由先失败的那个订阅者说了算。
-    Some(listeners.iter().map(|listener| listener(message.clone())).collect())
+    /// 摘掉一个订阅者。退订后 `topics[topic]` 仍存在（空 Vec）—— 判断有没有订阅者必须判空。
+    fn remove_listener(&self, topic: &str, listener: &Arc<Listener>) {
+        if let Some(listeners) = self.write().topics.get_mut(topic) {
+            listeners.retain(|current| !Arc::ptr_eq(current, listener));
+        }
+    }
+
+    /// 发布一条消息：有订阅者时交给订阅回调，否则入队等待 fetch 取回。
+    ///
+    /// 返回广播时每次投递的结算 future（供发送侧做结算判定，见 `_send`）；入队时返回 `None`。
+    /// 注意广播仍是 fire-and-forget：这里不等待，`post()` 也不会等订阅回调跑完。
+    fn publish(&self, topic: &str, message: MailMessage) -> Option<Vec<BoxFuture<'static, DeliveryResult>>> {
+        // 先 clone 出来再释放对 bus 的借用：监听器（core）会去拿自己的锁，绝不能持着 bus 的锁调它。
+        let listeners = {
+            let mut bus = self.write();
+            bus.last_activity
+                .insert(topic.to_string(), chrono::Utc::now().to_rfc3339());
+            bus.topics.get(topic).cloned().unwrap_or_default()
+        };
+
+        if listeners.is_empty() {
+            // 入队，等待 fetch 取回
+            self.write().queue.enqueue(topic.to_string(), message);
+            return None;
+        }
+
+        // 一条消息只走一条路：有订阅者就只走订阅。
+        // 两条路都走时，订阅者从不 fetch → 队列只涨不消；退订后一次 fetch 又会把已处理过的
+        // 消息再投递一遍（副作用执行两次）。必须判空：退订后 topics[topic] 仍存在（空 Vec）。
+        //
+        // 每次投递的结算要留一份给发送侧：部分失败时「整条消息回不回队」必须等全部投递结算后
+        // 才能判断，不能由先失败的那个订阅者说了算。
+        Some(listeners.iter().map(|listener| listener(message.clone())).collect())
+    }
+
+    /// 订阅失败 / nack 后把消息退回队列头部（去重规则见 [`MailMessageQueue::requeue`]）。
+    fn requeue(&self, topic: String, message: MailMessage) -> bool {
+        self.write().queue.requeue(topic, message)
+    }
+
+    /// 取一封并隐式 ack；算一次活动。
+    fn dequeue(&self, topic: &str) -> Option<MailMessage> {
+        self.touch(topic);
+        self.write().queue.dequeue(topic)
+    }
+
+    /// 取一封并进 in-flight（直到 ack / nack 或超时重投）；算一次活动。
+    fn dequeue_for_ack(&self, topic: &str, ack_timeout: Option<Duration>) -> Option<MailMessage> {
+        self.touch(topic);
+        self.write().queue.dequeue_for_ack(topic, ack_timeout)
+    }
+
+    fn ack(&self, message_id: &str) {
+        self.write().queue.ack(message_id);
+    }
+
+    fn nack(&self, message_id: &str, requeue: bool) {
+        self.write().queue.nack(message_id, requeue);
+    }
+
+    /// 【只读】取一份队列快照（副本），不出队、不建 in-flight、不刷活动时间。
+    ///
+    /// 注意：这里**不**写 `last_activity`。只读诊断不该把一个空闲地址刷成「刚刚有活动」，
+    /// 否则一个每隔几秒轮询一次的诊断页会让 `last_activity_time` 永远假绿。
+    fn peek(&self, topic: &str, limit: Option<usize>) -> Vec<MailMessage> {
+        self.read().queue.peek(topic, limit)
+    }
+
+    /// `status()` 的读数来源。只读：不写 `last_activity`（诊断页轮询不该把空闲地址刷成
+    /// 「刚刚有活动」）。
+    fn status_of(&self, topic: &str) -> BusTopicFacts {
+        let bus = self.read();
+        BusTopicFacts {
+            unread_count: bus.queue.get_status(topic),
+            // in-flight 消息已离开队列但尚未确认，单独报出来，否则 status 会把它们当作已处理完。
+            in_flight_count: bus.queue.in_flight_count(topic),
+            subscriber_count: bus.topics.get(topic).map(|l| l.len()).unwrap_or(0),
+            last_activity_time: bus.last_activity.get(topic).cloned(),
+        }
+    }
 }
 
 /// 订阅模式下广播结算后的处置入口（由结算 barrier 调用一次，不在每个订阅者失败时调用）。
 ///
 /// requeue=true（全部投递都失败）把消息退回 topic 队列头部，可被 `fetch` 取回且在
 /// `unread_count` 里可见；requeue=false（有订阅者成功，或失败不可重试）按死信处理直接丢弃。
-fn memory_nack_hook() -> crate::core::NackHook {
-    Arc::new(|message: MailMessage, requeue: bool| {
+///
+/// 回队落在**这个 provider 自己的 bus** 上（issue#3）：隔离 provider 的失败不该把消息退回
+/// 进程级共享总线，反之共享总线的也不会跑错地方。
+fn memory_nack_hook(bus: &MemoryEventBus) -> crate::core::NackHook {
+    let bus = bus.clone();
+    Arc::new(move |message: MailMessage, requeue: bool| {
+        let bus = bus.clone();
         Box::pin(async move {
             if !requeue {
                 return Ok(());
             }
             let topic = get_canonical_mailbox_address_identifier(&message.to)?;
-            touch(&topic);
-            BUS.write().unwrap().queue.requeue(topic, message);
+            bus.touch(&topic);
+            bus.requeue(topic, message);
             Ok(())
         })
     })
@@ -135,6 +309,7 @@ fn memory_nack_hook() -> crate::core::NackHook {
 
 pub struct MemoryProvider {
     core: Arc<ProviderCore>,
+    bus: MemoryEventBus,
 }
 
 impl Default for MemoryProvider {
@@ -144,26 +319,57 @@ impl Default for MemoryProvider {
 }
 
 impl MemoryProvider {
+    /// 默认构造：挂在进程级共享总线上（[`MemoryEventBus::get_instance`]）`None`）。
+    ///
+    /// 同进程里所有默认构造的 `MemoryProvider` 共用一份 `mem:` 状态 —— 跳 `Mailbox` 投递就靠
+    /// 它（向后兼容）；但「测试之间不串台」也就靠不上它（issue#3）。要隔离用
+    /// [`MemoryProvider::create_isolated`] 或 [`MemoryProvider::for_scope`]。
     pub fn new() -> Self {
-        Self::with_retry(None)
+        Self::with_options(None, None)
     }
 
     /// 开启订阅重试（opt-in）。不传则保持默认：订阅失败只把消息退回队列，不自动重投。
+    /// 总线仍是进程级共享那一份；要隔离用 [`MemoryProvider::create_isolated`]。
     pub fn with_retry(policy: Option<RetryPolicy>) -> Self {
-        Self::with_core_options(ProviderCoreOptions {
-            retry: policy,
-            ..ProviderCoreOptions::default()
-        })
+        Self::with_options(policy, None)
     }
 
-    fn with_core_options(options: ProviderCoreOptions) -> Self {
+    /// 造一个「自带私有总线」的 provider：同进程的其它 `mem:` 地址完全看不到它的队列与订阅。
+    /// 宿主 + 插件、kernel + provider 各持一个 `Mailbox`，以及测试隔离，都应该用这个
+    /// （对应 TS `createIsolated(retry?)` / Python `create_isolated(retry)`）。
+    pub fn create_isolated(policy: Option<RetryPolicy>) -> Self {
+        Self::with_options(policy, Some(MemoryEventBus::new()))
+    }
+
+    /// 造一个挂在命名空间总线上的 provider：同 `scope` 共享一份状态，不同 `scope` 互不可见。
+    /// 「一个进程里跑多个互不相干的 `mem:` 世界」用它，不需要自己管总线对象。
+    pub fn for_scope(scope: &str, policy: Option<RetryPolicy>) -> Self {
+        Self::with_options(policy, Some(MemoryEventBus::get_instance(Some(scope))))
+    }
+
+    /// 注入现成的总线（例如两个 `Mailbox` 就是要共享同一个「服务端」：把同一个
+    /// [`MemoryEventBus`] 句柄传两次；克隆句柄即共享状态）。
+    pub fn with_bus(bus: MemoryEventBus, policy: Option<RetryPolicy>) -> Self {
+        Self::with_options(policy, Some(bus))
+    }
+
+    /// 这个 provider 用的总线（对齐 TS 公开的 `provider.bus`）。
+    /// 单 topic 清理可以直接动手：`provider.bus().clear(Some(topic))`。
+    pub fn bus(&self) -> &MemoryEventBus {
+        &self.bus
+    }
+
+    fn with_options(policy: Option<RetryPolicy>, bus: Option<MemoryEventBus>) -> Self {
+        let bus = bus.unwrap_or_else(|| MemoryEventBus::get_instance(None));
         let options = ProviderCoreOptions {
+            retry: policy,
             broadcast: true, // 订阅是广播：一条消息对每个订阅者各投递一次
-            nack: Some(memory_nack_hook()),
-            ..options
+            nack: Some(memory_nack_hook(&bus)),
+            ..ProviderCoreOptions::default()
         };
         Self {
             core: ProviderCore::new("mem", options),
+            bus,
         }
     }
 
@@ -215,7 +421,19 @@ impl MailboxProvider for MemoryProvider {
 
     async fn close(&self) -> Result<()> {
         // 取消全部活跃订阅 + 待重投的投递，最后清零台账。
+        // 注意：`close()` **不**清消息队列——“关掉通道”不等于“销毁在途数据”。
+        // 要一并清掉积压消息用 [`crate::Mailbox::stop_and_purge`] 或下面的 `clear()`。
         self.core.close().await;
+        Ok(())
+    }
+
+    /// 丢弃这份总线上的所有消息（含 in-flight）与活动时间，订阅保持不变。
+    ///
+    /// 代价要写清楚：默认构造的 provider 共用进程级单例总线，`clear()` 就是清空全进程的
+    /// `mem:` 队列。只想清自己那份，用 [`MemoryProvider::create_isolated`] /
+    /// [`MemoryProvider::for_scope`]。单 topic 清理：`bus().clear(Some(topic))`。
+    async fn clear(&self) -> Result<()> {
+        self.bus.clear(None);
         Ok(())
     }
 
@@ -226,7 +444,7 @@ impl MailboxProvider for MemoryProvider {
     /// barrier 必须同步登记（任何 await 之前），否则派发时同步失败的投递会先看到“无 barrier”。
     async fn _send(&self, message: MailMessage) -> Result<()> {
         let topic = get_canonical_mailbox_address_identifier(&message.to)?;
-        let deliveries = match publish(&topic, message.clone()) {
+        let deliveries = match self.bus.publish(&topic, message.clone()) {
             Some(deliveries) => deliveries,
             None => return Ok(()), // 没有订阅者：消息入队，由 fetch / ack 那套语义负责
         };
@@ -244,27 +462,18 @@ impl MailboxProvider for MemoryProvider {
         // 对齐 TS / Python 的 MailboxProvider.subscribe：core 保存原始回调并驱动隐式 ack、
         // 错误处理、重试与投递结算；这里只负责把 core 给的监听器挂到总线上。
         let (sub_id, listener) = self.core.register_subscription(address, callback);
-
-        {
-            let mut bus = BUS.write().unwrap();
-            bus.topics
-                .entry(topic.clone())
-                .or_default()
-                .push(listener.clone());
-            bus.last_activity
-                .insert(topic.clone(), chrono::Utc::now().to_rfc3339());
-        }
+        self.bus.add_listener(&topic, listener.clone());
 
         let topic_for_unsub = topic.clone();
+        let bus = self.bus.clone();
         self.core.attach_unsubscribe(
             &sub_id,
             Box::new(move || {
                 let topic = topic_for_unsub.clone();
+                let bus = bus.clone();
                 let listener = listener.clone();
                 Box::pin(async move {
-                    if let Some(listeners) = BUS.write().unwrap().topics.get_mut(&topic) {
-                        listeners.retain(|l| !Arc::ptr_eq(l, &listener));
-                    }
+                    bus.remove_listener(&topic, &listener);
                     Ok(())
                 })
             }),
@@ -278,10 +487,9 @@ impl MailboxProvider for MemoryProvider {
         reject_peek_in_fetch(&options)?;
 
         let topic = get_canonical_mailbox_address_identifier(&address)?;
-        touch(&topic);
 
         if !options.manual_ack {
-            if let Some(msg) = BUS.write().unwrap().queue.dequeue(&topic) {
+            if let Some(msg) = self.bus.dequeue(&topic) {
                 return Ok(Some(AckableMessage {
                     message: msg,
                     ack: Box::new(|| Box::pin(async { Ok(()) })),
@@ -292,18 +500,20 @@ impl MailboxProvider for MemoryProvider {
         }
 
         let timeout = options.ack_timeout.map(Duration::from_millis);
-        if let Some(msg) = BUS.write().unwrap().queue.dequeue_for_ack(&topic, timeout) {
+        if let Some(msg) = self.bus.dequeue_for_ack(&topic, timeout) {
             let msg_id = msg.id.clone();
             let msg_id_nack = msg.id.clone();
+            let bus_for_ack = self.bus.clone();
+            let bus_for_nack = self.bus.clone();
 
             return Ok(Some(AckableMessage {
                 message: msg,
                 ack: Box::new(move || Box::pin(async move {
-                    BUS.write().unwrap().queue.ack(&msg_id);
+                    bus_for_ack.ack(&msg_id);
                     Ok(())
                 })),
                 nack: Box::new(move |requeue| Box::pin(async move {
-                    BUS.write().unwrap().queue.nack(&msg_id_nack, requeue);
+                    bus_for_nack.nack(&msg_id_nack, requeue);
                     Ok(())
                 })),
             }));
@@ -318,29 +528,24 @@ impl MailboxProvider for MemoryProvider {
     /// in-flight（默认 30s 后重投），既干扰正常消费者的计数，也不是只读（issue#4）。
     async fn peek(&self, address: Url, limit: Option<usize>) -> Result<Vec<MailMessage>> {
         let topic = get_canonical_mailbox_address_identifier(&address)?;
-        Ok(peek(&topic, normalize_peek_limit(limit)))
+        Ok(self.bus.peek(&topic, normalize_peek_limit(limit)))
     }
 
     /// 本总线认得的地址（canonical id）—— `mem:` 的消息就在本地，所以能枚举。
     async fn list_addresses(&self) -> Result<Vec<String>> {
-        Ok(list_topics())
+        Ok(self.bus.list_topics())
     }
 
     async fn status(&self, address: Url) -> Result<MailboxStatus> {
         let topic = get_canonical_mailbox_address_identifier(&address)?;
-        let bus = BUS.read().unwrap();
-
-        let exists = knows(&bus, &topic);
-        let unread_count = bus.queue.get_status(&topic);
-        // in-flight 消息已离开队列但尚未确认，单独报出来，否则 status 会把它们当作已处理完。
-        let in_flight_count = bus.queue.in_flight_count(&topic);
-        let subscriber_count = bus.topics.get(&topic).map(|l| l.len()).unwrap_or(0);
-        // 只读：这里不写 `last_activity`（诊断页轮询不该把空闲地址刷成“刚刚有活动”）。
-        let last_activity_time = bus.last_activity.get(&topic).cloned();
-        drop(bus);
+        let exists = self.bus.knows(&topic);
+        let facts = self.bus.status_of(&topic);
 
         let mut extra = HashMap::new();
-        extra.insert("subscriber_count".to_string(), serde_json::json!(subscriber_count));
+        extra.insert(
+            "subscriber_count".to_string(),
+            serde_json::json!(facts.subscriber_count),
+        );
 
         if !exists {
             // 对“这个地址从不存在”回 `online` + 0，诊断页就分不出「不存在」和「空闲」（issue#4）。
@@ -355,9 +560,9 @@ impl MailboxProvider for MemoryProvider {
             return Ok(MailboxStatus {
                 state: "unknown".to_string(),
                 exists: Some(false),
-                unread_count: Some(unread_count),
-                in_flight_count: Some(in_flight_count),
-                last_activity_time,
+                unread_count: Some(facts.unread_count),
+                in_flight_count: Some(facts.in_flight_count),
+                last_activity_time: facts.last_activity_time.clone(),
                 extra,
             });
         }
@@ -365,9 +570,9 @@ impl MailboxProvider for MemoryProvider {
         Ok(MailboxStatus {
             state: "online".to_string(),
             exists: Some(true),
-            unread_count: Some(unread_count),
-            in_flight_count: Some(in_flight_count),
-            last_activity_time,
+            unread_count: Some(facts.unread_count),
+            in_flight_count: Some(facts.in_flight_count),
+            last_activity_time: facts.last_activity_time,
             extra,
         })
     }
@@ -380,6 +585,7 @@ impl MailboxProvider for MemoryProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Mailbox;
     use crate::core::ProviderCore;
     use crate::delivery::FailureReason;
     use crate::error::MailboxError;
@@ -571,6 +777,8 @@ mod tests {
     }
 
     // --- 订阅与 fetch 二选一、in-flight 可见（与 TS / Python 端对齐）---
+    // 这里用的是默认构造的 provider（共享进程级总线），所以每个用例仍要用唯一 topic。
+    // 需要真隔离的用例见下面的 issue#3 隔离组（`MemoryProvider::create_isolated`）。
     // BUS 是全局单例，测试并发跑，地址必须全局唯一。
 
     #[tokio::test]
@@ -1998,16 +2206,15 @@ mod tests {
     #[test]
     fn test_bus_level_knowledge_and_topic_enumeration() {
         // 总线层的同一套语义（对应 Python 的 `MemoryEventBus.knows` / `list_topics`）。
+        // 这里用私有总线：它不登记进 scope 注册表，也就不会弄脏共享总线上的其他用例。
+        let bus = MemoryEventBus::new();
         let subscribed = "mem://rust-bus/list-a";
         let queued = "mem://rust-bus/list-b";
         let never = "mem://rust-bus/list-never";
 
-        {
-            let bus = BUS.read().unwrap();
-            assert!(!knows(&bus, never));
-        }
+        assert!(!bus.knows(never));
 
-        publish(
+        bus.publish(
             queued,
             MailMessage {
                 id: "list-b-1".to_string(),
@@ -2018,9 +2225,15 @@ mod tests {
                 meta: HashMap::new(),
             },
         );
-        BUS.write().unwrap().topics.entry(subscribed.to_string()).or_default();
 
-        let topics = list_topics();
+        // 退订后 `topics[topic]` 仍在（空 Vec）：只订阅过也算「这个地址有人用」。
+        let listener: Arc<Listener> = Arc::new(|message| {
+            Box::pin(async move { DeliveryResult::succeeded("list-a", &message.id) })
+        });
+        bus.add_listener(subscribed, listener.clone());
+        bus.remove_listener(subscribed, &listener);
+
+        let topics = bus.list_topics();
         assert!(topics.contains(&subscribed.to_string()), "{:?}", topics);
         assert!(topics.contains(&queued.to_string()), "{:?}", topics);
         assert!(!topics.contains(&never.to_string()));
@@ -2028,12 +2241,9 @@ mod tests {
         sorted.sort();
         assert_eq!(topics, sorted); // 快照与测试断言需要确定性
 
-        {
-            let bus = BUS.read().unwrap();
-            assert!(knows(&bus, subscribed)); // 只订阅也算“这个地址有人用”
-            assert!(knows(&bus, queued));
-            assert!(!knows(&bus, never));
-        }
+        assert!(bus.knows(subscribed)); // 只订阅也算“这个地址有人用”
+        assert!(bus.knows(queued));
+        assert!(!bus.knows(never));
     }
 
     /// 第三方广播 provider 的常见写法：`_send` 里把消息派发出去，但**丢弃**了每次投递的结算
@@ -2157,5 +2367,571 @@ mod tests {
         fn generate_id(&self) -> String {
             Uuid::new_v4().to_string()
         }
+    }
+
+    // --- issue#3：`MemoryEventBus` 的实例边界与状态清理 ---------------------------------------
+    //
+    // 与 TS `src/providers/memory.isolation.test.ts`、Python `tests/test_memory_isolation.py`
+    // 同一组不变量。要锁住两件事：
+    // 1. **默认行为不变**：默认构造的 `MemoryProvider` 仍共享进程级 bus（「模拟服务端」语义），
+    //    `stop()` 默认仍不清队列 —— 连「共享带来的串台」也断言下来，而不是只断言隔离路径。
+    // 2. **可隔离、可清理**：私有 bus / scope / 注入 bus 三个入口，以及
+    //    `MailMessageQueue::clear` → `MemoryEventBus::clear` → `MemoryProvider::clear` →
+    //    `Mailbox::clear` / `stop_and_purge` 这条完整链路（Mailbox 层见 `mailbox.rs` 的同名测试组）。
+
+    const ISO_SENDER: &str = "mem:iso-sender@bus/outbox";
+
+    static ISO_SEQ: AtomicUsize = AtomicUsize::new(0);
+
+    /// 即便跑在共享 bus 上，用例之间也不能互相看到对方的 topic。
+    fn iso_addr(label: &str) -> Url {
+        format!("mem:iso{}-{}@bus/inbox", ISO_SEQ.fetch_add(1, Ordering::SeqCst), label)
+            .parse()
+            .unwrap()
+    }
+
+    fn iso_scope(label: &str) -> String {
+        format!("iso-suite-{}-{}", label, ISO_SEQ.fetch_add(1, Ordering::SeqCst))
+    }
+
+    fn iso_mailbox(provider: MemoryProvider) -> Mailbox {
+        let mut mailbox = Mailbox::new();
+        mailbox.register_provider(Box::new(provider));
+        mailbox
+    }
+
+    fn iso_mail(to: &Url, body: serde_json::Value) -> OutgoingMail {
+        OutgoingMail {
+            id: None,
+            from: ISO_SENDER.parse().unwrap(),
+            to: to.clone(),
+            body,
+            headers: HashMap::new(),
+            meta: HashMap::new(),
+        }
+    }
+
+    /// 直接喂给 `MemoryEventBus` 的裸消息（跳过 provider 层）。
+    fn bus_msg(id: &str, topic: &str) -> MailMessage {
+        MailMessage {
+            id: id.to_string(),
+            from: "mem:probe@example.com/out".parse().unwrap(),
+            to: topic.parse().unwrap(),
+            body: json!({ "id": id }),
+            headers: HashMap::new(),
+            meta: HashMap::new(),
+        }
+    }
+
+    /// 计数型订阅回调（provider 层）。
+    fn counting(hits: Arc<AtomicUsize>) -> SubscriptionHandler {
+        Box::new(move |_message| {
+            let hits = hits.clone();
+            Box::pin(async move {
+                hits.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+        })
+    }
+
+    /// 永远抛可重试错误的订阅回调（provider 层）。
+    fn always_failing(calls: Arc<AtomicUsize>) -> SubscriptionHandler {
+        Box::new(move |_message| {
+            let calls = calls.clone();
+            Box::pin(async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err(MailboxError::Retriable("upstream down".to_string()))
+            })
+        })
+    }
+
+    /// 计数型监听器（总线层，绕过 provider）。
+    fn counting_listener(hits: Arc<AtomicUsize>) -> Arc<Listener> {
+        Arc::new(move |message: MailMessage| {
+            let hits = hits.clone();
+            Box::pin(async move {
+                hits.fetch_add(1, Ordering::SeqCst);
+                DeliveryResult::succeeded("bus-listener", &message.id)
+            })
+        })
+    }
+
+    fn subscriber_count(status: &MailboxStatus) -> u64 {
+        status
+            .extra
+            .get("subscriber_count")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn test_default_bus_is_the_process_wide_singleton() {
+        let shared = MemoryEventBus::get_instance(None);
+
+        assert_eq!(MemoryEventBus::get_instance(None), shared);
+        assert_eq!(DEFAULT_MEMORY_SCOPE, "");
+        assert_eq!(shared.scope(), DEFAULT_MEMORY_SCOPE);
+        // 显式空串 = 默认那份（与 TS / Python 同一个 scope 键）。
+        assert_eq!(MemoryEventBus::get_instance(Some("")), shared);
+    }
+
+    #[test]
+    fn test_scope_registry_hands_out_one_bus_per_scope() {
+        let a1 = MemoryEventBus::get_instance(Some("rust-suite-a"));
+        let a2 = MemoryEventBus::get_instance(Some("rust-suite-a"));
+        let b = MemoryEventBus::get_instance(Some("rust-suite-b"));
+
+        assert_eq!(a1, a2);
+        assert_ne!(a1, b);
+        assert_ne!(a1, MemoryEventBus::get_instance(None));
+        assert_eq!(a1.scope(), "rust-suite-a");
+        assert_eq!(b.scope(), "rust-suite-b");
+    }
+
+    #[test]
+    fn test_private_bus_is_not_registered_in_the_scope_registry() {
+        let own = MemoryEventBus::new();
+        let other = MemoryEventBus::new();
+        let labeled = MemoryEventBus::with_scope("rust-labeled");
+
+        assert_ne!(own, other);
+        assert_ne!(own, MemoryEventBus::get_instance(None)); // 手工实例 ≠ 默认单例
+        assert_eq!(own.scope(), DEFAULT_MEMORY_SCOPE);
+        assert_eq!(labeled.scope(), "rust-labeled");
+        // 注册表里另起一份：私有的带名总线不会被 `get_instance` 认出来。
+        assert_ne!(MemoryEventBus::get_instance(Some("rust-labeled")), labeled);
+    }
+
+    #[tokio::test]
+    async fn test_buses_share_no_topics_queues_in_flight_or_activity() -> Result<()> {
+        let x = MemoryEventBus::new();
+        let y = MemoryEventBus::new();
+        let topic = "mem:same-topic-both-buses/inbox"; // 同名 topic，故意撞
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        x.add_listener(topic, counting_listener(hits.clone()));
+
+        // x 上有订阅者：走广播，不入队。
+        let deliveries = x.publish(topic, bus_msg("x-1", topic)).expect("有订阅者：必须返回结算 future");
+        assert_eq!(deliveries.len(), 1);
+        for settlement in deliveries {
+            settlement.await;
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+        // y 上没人订阅同一个 topic：publish 只能入队，绝不会被 x 的订阅者接走。
+        assert!(y.publish(topic, bus_msg("y-1", topic)).is_none());
+        assert_eq!(y.status_of(topic).unread_count, 1);
+        assert_eq!(y.status_of(topic).subscriber_count, 0);
+        assert_eq!(x.status_of(topic).unread_count, 0);
+        assert_eq!(x.status_of(topic).subscriber_count, 1);
+
+        // 取消息也不会跨 bus。
+        assert_eq!(y.dequeue(topic).map(|message| message.id), Some("y-1".to_string()));
+        assert!(x.dequeue(topic).is_none());
+
+        // in-flight 也是各自一份。
+        y.publish(topic, bus_msg("y-2", topic));
+        assert_eq!(
+            y.dequeue_for_ack(topic, Some(Duration::from_secs(1))).map(|message| message.id),
+            Some("y-2".to_string())
+        );
+        assert_eq!(y.status_of(topic).in_flight_count, 1);
+        assert_eq!(x.status_of(topic).in_flight_count, 0);
+
+        // last_activity 各自一份：y 没碰过的 topic 在 y 上是空的。
+        x.publish("mem:only-on-x/inbox", bus_msg("x-2", "mem:only-on-x/inbox"));
+        assert!(x.status_of("mem:only-on-x/inbox").last_activity_time.is_some());
+        assert!(y.status_of("mem:only-on-x/inbox").last_activity_time.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_two_providers_on_one_bus_still_share_the_server() -> Result<()> {
+        // 注入同一份 bus = 共享一个「服务端」：这是既有能力，隔离改造不能把它拆掉。
+        let bus = MemoryEventBus::new();
+        let addr = iso_addr("shared-bus");
+        let a = MemoryProvider::with_bus(bus.clone(), None);
+        let b = MemoryProvider::with_bus(bus, None);
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let _sub = b.subscribe(addr.clone(), counting(hits.clone())).await?;
+
+        post_once(&a, &addr, "shared-bus-1").await?;
+        assert!(wait_until(|| {
+            let hits = hits.clone();
+            async move { hits.load(Ordering::SeqCst) >= 1 }
+        }).await);
+        // 订阅表是这份 bus 共有的：A 也看得见 B 的订阅。
+        assert_eq!(subscriber_count(&a.status(addr).await?), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_default_providers_still_share_the_bus_across_mailboxes() -> Result<()> {
+        // 向后兼容：默认构造仍是进程级单例 bus，跨 Mailbox 投递照旧可达。
+        let a = MemoryProvider::new();
+        let b = MemoryProvider::new();
+        assert_eq!(a.bus(), &MemoryEventBus::get_instance(None));
+        assert_eq!(a.bus(), b.bus());
+
+        let addr = iso_addr("default-shared");
+        let hits = Arc::new(AtomicUsize::new(0));
+        let _sub = b.subscribe(addr.clone(), counting(hits.clone())).await?;
+
+        let a = iso_mailbox(a);
+        a.start().await?;
+        a.post(iso_mail(&addr, json!({ "n": 1 }))).await?;
+        assert!(wait_until(|| {
+            let hits = hits.clone();
+            async move { hits.load(Ordering::SeqCst) >= 1 }
+        }).await);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_default_bus_queue_is_shared_the_documented_cost() -> Result<()> {
+        // 共享 bus 的既有语义，断言下来：B 能 fetch 走 A 的消息。
+        let addr = iso_addr("default-steal");
+        let a = iso_mailbox(MemoryProvider::new());
+        let b = iso_mailbox(MemoryProvider::new());
+
+        a.post(iso_mail(&addr, json!({ "from": "A" }))).await?;
+
+        let taken = b.fetch(addr.clone(), FetchOptions::default()).await?;
+        assert_eq!(taken.map(|taken| taken.message.body), Some(json!({ "from": "A" })));
+        assert_eq!(a.status(addr).await?.unread_count, Some(0));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_create_isolated_keeps_broadcasts_queues_and_subscriber_tables_apart() -> Result<()> {
+        let addr = iso_addr("isolated-broadcast");
+        let a = iso_mailbox(MemoryProvider::create_isolated(None));
+        let b = iso_mailbox(MemoryProvider::create_isolated(None));
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let _sub = b.subscribe(addr.clone(), counting(hits.clone())).await?;
+
+        a.post(iso_mail(&addr, json!({ "n": 1 }))).await?;
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        assert_eq!(hits.load(Ordering::SeqCst), 0); // 广播不串台
+        assert_eq!(b.status(addr.clone()).await?.unread_count, Some(0)); // 队列不串台
+        assert_eq!(subscriber_count(&b.status(addr.clone()).await?), 1); // B 自己的订阅还在
+        assert_eq!(subscriber_count(&a.status(addr).await?), 0); // A 看不见 B 的订阅
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_create_isolated_queue_cannot_be_consumed_by_another_instance() -> Result<()> {
+        let addr = iso_addr("isolated-queue");
+        let a = iso_mailbox(MemoryProvider::create_isolated(None));
+        let b = iso_mailbox(MemoryProvider::create_isolated(None));
+
+        a.post(iso_mail(&addr, json!({ "from": "A" }))).await?;
+
+        assert!(b.fetch(addr.clone(), FetchOptions::default()).await?.is_none());
+        assert_eq!(b.status(addr.clone()).await?.unread_count, Some(0));
+        let mine = a.fetch(addr, FetchOptions::default()).await?;
+        assert_eq!(mine.map(|mine| mine.message.body), Some(json!({ "from": "A" })));
+        Ok(())
+    }
+
+    #[test]
+    fn test_create_isolated_hands_out_a_fresh_private_bus_each_time() {
+        let a = MemoryProvider::create_isolated(None);
+        let b = MemoryProvider::create_isolated(None);
+
+        assert_ne!(a.bus(), b.bus());
+        assert_ne!(a.bus(), &MemoryEventBus::get_instance(None));
+        assert_eq!(a.bus().scope(), DEFAULT_MEMORY_SCOPE); // 私有 bus 不属于任何 scope
+    }
+
+    #[tokio::test]
+    async fn test_closing_one_isolated_instance_leaves_the_other_running() -> Result<()> {
+        let addr = iso_addr("isolated-stop");
+        let a = iso_mailbox(MemoryProvider::create_isolated(None));
+        let b = iso_mailbox(MemoryProvider::create_isolated(None));
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let _sub = b.subscribe(addr.clone(), counting(hits.clone())).await?;
+
+        a.stop().await?; // 只停 A
+
+        b.post(iso_mail(&addr, json!({ "n": 1 }))).await?;
+        assert!(wait_until(|| {
+            let hits = hits.clone();
+            async move { hits.load(Ordering::SeqCst) >= 1 }
+        }).await);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_isolated_retry_policy_requeues_into_its_own_bus() -> Result<()> {
+        let scope_addr = iso_addr("isolated-retry");
+        let a = iso_mailbox(MemoryProvider::create_isolated(Some(RetryPolicy::new(
+            3,
+            Duration::from_millis(1),
+        ))));
+        let b = iso_mailbox(MemoryProvider::create_isolated(None));
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let _sub = a.subscribe(scope_addr.clone(), always_failing(calls.clone())).await?;
+
+        a.post(iso_mail(&scope_addr, json!({ "n": 1 }))).await?;
+
+        assert!(wait_until(|| {
+            let calls = calls.clone();
+            async move { calls.load(Ordering::SeqCst) >= 3 }
+        }).await);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 3); // maxAttempts = 3，三次后放弃
+        // 重试耗尽：消息回自己的队列，由 fetch 兜底；别的实例看不到。
+        assert!(wait_until(|| async {
+            matches!(a.status(scope_addr.clone()).await, Ok(s) if s.unread_count == Some(1))
+        }).await);
+        assert_eq!(b.status(scope_addr).await?.unread_count, Some(0));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_isolated_failure_requeue_lands_on_that_bus_only() -> Result<()> {
+        // 与 issue#1 / #2 的兜底语义联动：不重试时失败只回队，而且只回自己那份 bus。
+        let addr = iso_addr("isolated-requeue");
+        let a = iso_mailbox(MemoryProvider::create_isolated(None));
+        let b = iso_mailbox(MemoryProvider::create_isolated(None));
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let _sub = a.subscribe(addr.clone(), always_failing(calls.clone())).await?;
+
+        a.post(iso_mail(&addr, json!({ "n": 1 }))).await?;
+
+        assert!(wait_until(|| async {
+            matches!(a.status(addr.clone()).await, Ok(s) if s.unread_count == Some(1))
+        }).await);
+        let mine = a.fetch(addr.clone(), FetchOptions::default()).await?;
+        assert_eq!(mine.map(|mine| mine.message.body), Some(json!({ "n": 1 }))); // A 自己能取回
+        assert_eq!(b.status(addr).await?.unread_count, Some(0));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_for_scope_shared_within_scope_isolated_across_scopes() -> Result<()> {
+        let scope = iso_scope("scoped");
+        let other_scope = iso_scope("scoped-other");
+        let addr = iso_addr("scoped");
+
+        let provider_a = MemoryProvider::for_scope(&scope, None);
+        let provider_b = MemoryProvider::for_scope(&scope, None);
+        assert_eq!(provider_a.bus(), provider_b.bus());
+        assert_eq!(provider_a.bus(), &MemoryEventBus::get_instance(Some(&scope)));
+        assert_ne!(provider_a.bus(), &MemoryEventBus::get_instance(None));
+        assert_eq!(provider_a.bus().scope(), scope);
+
+        let a = iso_mailbox(provider_a);
+        let b = iso_mailbox(provider_b);
+        let elsewhere = iso_mailbox(MemoryProvider::for_scope(&other_scope, None));
+        let default = iso_mailbox(MemoryProvider::new());
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let _sub = b.subscribe(addr.clone(), counting(hits.clone())).await?;
+
+        a.post(iso_mail(&addr, json!({ "n": 1 }))).await?;
+        assert!(wait_until(|| {
+            let hits = hits.clone();
+            async move { hits.load(Ordering::SeqCst) >= 1 }
+        }).await, "同 scope 必须互通");
+
+        // 异 scope 与默认 bus 都看不见这份状态。
+        assert_eq!(elsewhere.status(addr.clone()).await?.unread_count, Some(0));
+        assert_eq!(subscriber_count(&elsewhere.status(addr.clone()).await?), 0);
+        assert_eq!(default.status(addr).await?.unread_count, Some(0));
+        Ok(())
+    }
+
+    #[test]
+    fn test_injected_bus_is_the_one_the_provider_uses() {
+        let bus = MemoryEventBus::new();
+
+        assert_eq!(MemoryProvider::with_bus(bus.clone(), None).bus(), &bus);
+        assert_eq!(
+            MemoryProvider::with_bus(bus.clone(), Some(RetryPolicy::new(2, Duration::from_millis(1)))).bus(),
+            &bus
+        );
+        // 不注入则回落默认单例（向后兼容）。
+        assert_eq!(MemoryProvider::new().bus(), &MemoryEventBus::get_instance(None));
+        assert_eq!(MemoryProvider::default().bus(), &MemoryEventBus::get_instance(None));
+    }
+
+    #[tokio::test]
+    async fn test_shared_bus_close_only_tears_down_its_own_subscriptions() -> Result<()> {
+        // Rust 与 TS 的一处差异（值得钉住）：TS 的订阅表挂在 provider 上，所以「同一个 provider
+        // 实例注册进两个 Mailbox」时一边的 `stop()` 会拆掉另一边的订阅（TS 为此告警一次）。
+        // Rust 的 `register_provider(Box<dyn …>)` 转移所有权，一个 provider 实例不可能属于两个
+        // Mailbox；共享的是 bus，而每个 provider 的 core 只管自己的订阅 —— 于是 `stop()` 只拆自己
+        // 那一侧。真正会互相影响的是队列状态（见 `test_clear_on_a_shared_bus_purges_the_whole_scope`）。
+        let bus = MemoryEventBus::new();
+        let addr = iso_addr("shared-bus-close");
+        let a = iso_mailbox(MemoryProvider::with_bus(bus.clone(), None));
+        let b = iso_mailbox(MemoryProvider::with_bus(bus.clone(), None));
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let mut b_sub = b.subscribe(addr.clone(), counting(hits.clone())).await?;
+        let a_sub = a.subscribe(addr.clone(), Box::new(|_| Box::pin(async { Ok(()) }))).await?;
+
+        a.stop().await?; // 只拆 A 这一侧
+
+        assert_eq!(a_sub.status(), SubscriptionStatus::Closed);
+        assert_eq!(b_sub.status(), SubscriptionStatus::Active);
+
+        b.post(iso_mail(&addr, json!({ "n": 1 }))).await?;
+        assert!(wait_until(|| {
+            let hits = hits.clone();
+            async move { hits.load(Ordering::SeqCst) >= 1 }
+        }).await);
+        assert_eq!(subscriber_count(&b.status(addr).await?), 1); // A 的订阅已从这份 bus 上摘掉
+        b_sub.unsubscribe().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_bus_clear_topic_drops_queued_and_in_flight_but_keeps_subscriptions() -> Result<()> {
+        let bus = MemoryEventBus::new();
+        let provider = MemoryProvider::with_bus(bus.clone(), None);
+        let mailbox = iso_mailbox(provider);
+        mailbox.start().await?;
+
+        let kept = iso_addr("bus-clear-kept");
+        let dropped = iso_addr("bus-clear-dropped");
+        mailbox.post(iso_mail(&kept, json!({ "n": 1 }))).await?;
+        mailbox.post(iso_mail(&dropped, json!({ "n": 1 }))).await?;
+        mailbox.post(iso_mail(&dropped, json!({ "n": 2 }))).await?;
+
+        let taken = mailbox
+            .fetch(dropped.clone(), FetchOptions { manual_ack: true, ..Default::default() })
+            .await?;
+        assert!(taken.is_some());
+        assert_eq!(mailbox.status(dropped.clone()).await?.in_flight_count, Some(1));
+
+        let topic = get_canonical_mailbox_address_identifier(&dropped)?;
+        assert_eq!(bus.clear(Some(&topic)), 2); // 1 条等待 + 1 条 in-flight
+
+        let status = mailbox.status(dropped.clone()).await?;
+        assert_eq!(status.unread_count, Some(0));
+        assert_eq!(status.in_flight_count, Some(0));
+        // 消息与活动记录都没了：这个地址在这份 bus 上不再存在（issue#4 的诚实 status）。
+        assert_eq!(status.last_activity_time, None);
+        assert_eq!(status.state, "unknown");
+        assert_eq!(status.exists, Some(false));
+        assert_eq!(subscriber_count(&status), 0);
+        assert_eq!(mailbox.status(kept).await?.unread_count, Some(1)); // 只清指定 topic
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_cleared_in_flight_never_comes_back_via_a_late_ack_or_nack() -> Result<()> {
+        let bus = MemoryEventBus::new();
+        let provider = MemoryProvider::with_bus(bus.clone(), None);
+        let addr: Url = "mem:late-settlement/inbox".parse()?;
+        // bus 的 key 是 canonical id：provider 层进来的地址已经规范化过了。
+        let topic = get_canonical_mailbox_address_identifier(&addr)?;
+
+        post_once(&provider, &addr, "late-1").await?;
+        let taken = provider
+            .fetch(addr.clone(), FetchOptions { manual_ack: true, ..Default::default() })
+            .await?
+            .expect("必须取到那封信");
+        assert_eq!(bus.status_of(&topic).in_flight_count, 1);
+
+        assert_eq!(bus.clear(Some(&topic)), 1);
+
+        // 迟到的 ack / nack(requeue) 都不能把它复活成幽灵消息。
+        taken.ack().await?;
+        bus.ack("late-1");
+        bus.nack("late-1", true);
+
+        let facts = bus.status_of(&topic);
+        assert_eq!(facts.unread_count, 0);
+        assert_eq!(facts.in_flight_count, 0);
+        assert!(bus.dequeue(&topic).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn test_bus_clear_all_drops_messages_and_activity_and_is_idempotent() {
+        let bus = MemoryEventBus::new();
+        let a = "mem:clear-all-a/inbox";
+        let b = "mem:clear-all-b/inbox";
+
+        bus.publish(a, bus_msg("a-1", a));
+        bus.publish(b, bus_msg("b-1", b));
+        bus.publish(b, bus_msg("b-2", b));
+        bus.dequeue_for_ack(b, Some(Duration::from_secs(1)));
+
+        assert_eq!(bus.clear(None), 3); // 2 条等待 + 1 条 in-flight
+        for topic in [a, b] {
+            let facts = bus.status_of(topic);
+            assert!(!bus.knows(topic));
+            assert_eq!(facts.unread_count, 0);
+            assert_eq!(facts.in_flight_count, 0);
+            assert!(facts.last_activity_time.is_none());
+        }
+        assert_eq!(bus.clear(None), 0);
+        assert_eq!(bus.clear(Some("never-seen")), 0);
+    }
+
+    #[tokio::test]
+    async fn test_bus_clear_keeps_listeners_and_keeps_delivering() -> Result<()> {
+        let bus = MemoryEventBus::new();
+        let topic = "mem:clear-keeps-listener/inbox";
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        bus.add_listener(topic, counting_listener(hits.clone()));
+
+        for settlement in bus.publish(topic, bus_msg("before", topic)).expect("有订阅者：走广播") {
+            settlement.await;
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+        assert_eq!(bus.clear(Some(topic)), 0);
+        assert_eq!(bus.status_of(topic).subscriber_count, 1); // 订阅表未被拆
+
+        for settlement in bus.publish(topic, bus_msg("after", topic)).expect("有订阅者：走广播") {
+            settlement.await;
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 2); // 清理之后照旧投递
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_provider_clear_only_purges_its_own_bus() -> Result<()> {
+        let addr = iso_addr("provider-clear");
+        let a = iso_mailbox(MemoryProvider::create_isolated(None));
+        let b = iso_mailbox(MemoryProvider::create_isolated(None));
+
+        a.post(iso_mail(&addr, json!({ "n": 1 }))).await?;
+        b.post(iso_mail(&addr, json!({ "n": 2 }))).await?;
+
+        a.clear().await?;
+
+        assert_eq!(a.status(addr.clone()).await?.unread_count, Some(0));
+        assert_eq!(b.status(addr).await?.unread_count, Some(1));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_clear_on_a_shared_bus_purges_the_whole_scope() -> Result<()> {
+        // 文档化的代价：共享「服务端」就是这个含义 —— 同 scope 里 A.clear() 会清掉 B 的队列。
+        let scope = iso_scope("shared-purge");
+        let addr = iso_addr("shared-purge");
+        let a = iso_mailbox(MemoryProvider::for_scope(&scope, None));
+        let b = iso_mailbox(MemoryProvider::for_scope(&scope, None));
+
+        b.post(iso_mail(&addr, json!({ "n": 1 }))).await?;
+        a.clear().await?;
+
+        assert_eq!(b.status(addr).await?.unread_count, Some(0));
+        Ok(())
     }
 }

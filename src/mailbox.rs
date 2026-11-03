@@ -83,6 +83,11 @@ impl Mailbox {
 
     /**
      * 关闭所有注册的 Provider，并释放资源。
+     *
+     * 默认只拆订阅、不动积压消息：`stop()` 后同一个 provider（或共享同一份状态的另一个
+     * `Mailbox`）重新 `start()`，队列里的残留消息照旧可见 —— 这就是 issue#3 里「测试隔离失效」
+     * 的根源。确实要销毁状态用 [`Mailbox::stop_and_purge`]（= TS `stop({ purge: true })` /
+     * Python `stop(purge=True)`）。
      */
     pub async fn stop(&self) -> Result<()> {
         let mut futures = Vec::new();
@@ -91,6 +96,41 @@ impl Mailbox {
         }
         
         // 并行关闭
+        let results = futures::future::join_all(futures).await;
+        for res in results {
+            res?;
+        }
+        Ok(())
+    }
+
+    /**
+     * 先拆订阅（`close`），再丢弃各 provider 的积压消息（含 in-flight）。
+     * 等价于 TS 的 `mailbox.stop({ purge: true })` / Python 的 `stop(purge=True)`；Rust 没有
+     * 可选参数，所以拆成两个方法。没实现 `clear()` 的 provider（传输型）在这一步是 no-op。
+     */
+    pub async fn stop_and_purge(&self) -> Result<()> {
+        self.stop().await?;
+        self.clear().await
+    }
+
+    /**
+     * 丢弃各 provider 持有的积压消息（含 in-flight），**不**拆订阅。
+     *
+     * 测试隔离、用例之间重置状态用它；没实现 [`MailboxProvider::clear`] 的 provider 会被跳过
+     * （清 broker 属于破坏性运维，库不代劳）。拆订阅是 `stop()` 的事；反过来，`clear()` 不拆订阅：
+     * 那会让旧 `Subscription` 变成「报 active 但再也收不到消息」的僵尸。
+     *
+     * 注意默认构造的 `MemoryProvider` 共用进程级单例总线 —— `clear()` 会清掉同一份总线上其它
+     * `Mailbox` 的队列。只清自己那份，请用 `MemoryProvider::create_isolated()` 或
+     * `MemoryProvider::for_scope(scope, ..)`（issue#3）。
+     */
+    pub async fn clear(&self) -> Result<()> {
+        let mut futures = Vec::new();
+        for provider in self.providers.values() {
+            futures.push(provider.clear());
+        }
+
+        // 并行清理
         let results = futures::future::join_all(futures).await;
         for res in results {
             res?;
@@ -309,10 +349,12 @@ impl Default for Mailbox {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::SubscriptionStatus;
     use crate::providers::memory::MemoryProvider;
     use crate::utils::get_canonical_mailbox_address_identifier;
     use async_trait::async_trait;
     use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
 
     #[tokio::test]
@@ -376,8 +418,9 @@ mod tests {
     // 与 TS `src/mailbox.status-diagnostics.test.ts` + `src/mailbox.peek.test.ts` +
     // `src/mailbox.address-canonicalization.test.ts`、Python `tests/test_status_diagnostics.py`
     // 同一组不变量。
-    // 注：`mem:` 总线仍是进程级单例（issue#3 的实例隔离未背移到 Rust），所以涉及 `MemoryProvider`
-    // 的快照断言只看本次创建的那几个地址，不用绝对计数；需要确定性的快照测试用下面的本地 provider。
+    // 注：默认构造的 `MemoryProvider` 仍共享进程级总线（`MemoryProvider::create_isolated()` 才是
+    // 隔离的，见 issue#3），所以涉及 `MemoryProvider` 的快照断言只看本次创建的那几个地址，不用
+    // 绝对计数；需要确定性的快照测试用下面的本地 provider。
 
     /// 消息不在本地：既答不了 status，也枚举不了自己的地址（AMQP / SQS 那一类 broker）。
     struct RemoteBrokerProvider {
@@ -887,6 +930,226 @@ mod tests {
             .expect("本次投递的 topic 必须在快照里");
         assert_eq!(entry.status.unread_count, Some(1));
         assert_eq!(entry.status.exists, Some(true));
+        Ok(())
+    }
+
+    // --- issue#3：清理链路 `MailboxProvider::clear` → `Mailbox::clear` / `stop_and_purge` ------
+    //
+    // 与 TS `src/providers/memory.isolation.test.ts` 的清理组、Python `tests/test_memory_isolation.py`
+    // 同一组不变量。provider 层的实例边界（私有 bus / scope）见 `providers/memory.rs` 的同名测试组。
+
+    static SCOPE_SEQ: AtomicUsize = AtomicUsize::new(0);
+
+    /// 隔离用的唯一 scope（不弄脏进程级共享总线，也不被其它用例弄脏）。
+    fn unique_scope(label: &str) -> String {
+        format!("rust-{}-{}", label, SCOPE_SEQ.fetch_add(1, Ordering::SeqCst))
+    }
+
+    /// 轮询等待条件成立（订阅回调在 spawn 的任务里跑）。
+    async fn wait_until<Fut: std::future::Future<Output = bool>>(cond: impl Fn() -> Fut) -> bool {
+        for _ in 0..100 {
+            if cond().await {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        false
+    }
+
+    /// 数 `clear()` 被调了几次的夹具；消息存在本地，好断言「清没清」。
+    struct ClearCounterProvider {
+        cleared: Arc<AtomicUsize>,
+        queued: Arc<Mutex<Vec<MailMessage>>>,
+    }
+
+    #[async_trait]
+    impl MailboxProvider for ClearCounterProvider {
+        fn protocol(&self) -> &str {
+            "counter"
+        }
+
+        async fn _send(&self, message: MailMessage) -> Result<()> {
+            self.queued.lock().unwrap().push(message);
+            Ok(())
+        }
+
+        async fn subscribe(
+            &self,
+            _address: Url,
+            _callback: SubscriptionHandler,
+        ) -> Result<Box<dyn Subscription>> {
+            Err(MailboxError::unsupported_capability(self.protocol(), "subscriptions"))
+        }
+
+        async fn fetch(&self, _address: Url, options: FetchOptions) -> Result<Option<AckableMessage>> {
+            crate::provider::reject_peek_in_fetch(&options)?;
+            let message = self.queued.lock().unwrap().remove(0);
+            Ok(Some(AckableMessage {
+                message,
+                ack: Box::new(|| Box::pin(async { Ok(()) })),
+                nack: Box::new(|_| Box::pin(async { Ok(()) })),
+            }))
+        }
+
+        async fn clear(&self) -> Result<()> {
+            self.cleared.fetch_add(1, Ordering::SeqCst);
+            self.queued.lock().unwrap().clear();
+            Ok(())
+        }
+
+        fn generate_id(&self) -> String {
+            "counter-id".to_string()
+        }
+    }
+
+    #[tokio::test]
+    async fn test_clear_runs_on_every_provider_and_skips_the_no_op_ones() -> Result<()> {
+        // 没覆写 `clear()` 的 provider（传输型）必须是 no-op：清 broker 属于破坏性运维，库不代劳。
+        let cleared = Arc::new(AtomicUsize::new(0));
+        let counter_queue: Arc<Mutex<Vec<MailMessage>>> = Arc::new(Mutex::new(Vec::new()));
+        let broker = remote("nostatus");
+        let broker_sent = broker.sent.clone();
+
+        let mut mailbox = Mailbox::new();
+        mailbox.register_provider(Box::new(ClearCounterProvider {
+            cleared: cleared.clone(),
+            queued: counter_queue.clone(),
+        }));
+        mailbox.register_provider(Box::new(broker));
+
+        mailbox.post(mail("counter:a/u", "counter:box/inbox", json!({ "n": 1 }))).await?;
+        mailbox.post(mail("nostatus:a/u", "nostatus:box/inbox", json!({ "n": 1 }))).await?;
+
+        mailbox.clear().await?;
+
+        assert_eq!(cleared.load(Ordering::SeqCst), 1); // 每个 provider 各调一次
+        assert!(counter_queue.lock().unwrap().is_empty()); // 覆写了的：本地消息没了
+        assert_eq!(broker_sent.lock().unwrap().len(), 1); // 没覆写的：什么都没被动
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_clear_is_idempotent_and_fine_without_any_provider() -> Result<()> {
+        let mailbox = mailbox_with(Box::new(MemoryProvider::create_isolated(None)));
+        mailbox.post(mail("mem:rust-clear/sender", "mem:rust-clear/idempotent", json!({}))).await?;
+
+        mailbox.clear().await?;
+        mailbox.clear().await?; // 重复调不报错
+        assert_eq!(
+            mailbox.status("mem:rust-clear/idempotent".parse()?).await?.unread_count,
+            Some(0)
+        );
+
+        Mailbox::new().clear().await?; // 空 Mailbox
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_clear_drops_the_backlog_but_keeps_subscriptions() -> Result<()> {
+        // `clear()` 不拆订阅：拆它是 `stop()` / `unsubscribe()` 的事。在 clear 里顺手拆订阅，
+        // 旧 `Subscription` 会变成「报 active 但再也收不到消息」的僵尸。
+        let mailbox = mailbox_with(Box::new(MemoryProvider::create_isolated(None)));
+        let queued: Url = "mem:rust-clear/keep-sub-queue".parse()?;
+        let live: Url = "mem:rust-clear/keep-sub-live".parse()?;
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let mut sub = mailbox.subscribe(live.clone(), {
+            let hits = hits.clone();
+            Box::new(move |_message| {
+                let hits = hits.clone();
+                Box::pin(async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })
+            })
+        }).await?;
+
+        mailbox.post(mail("mem:rust-clear/sender", queued.as_str(), json!({ "n": 1 }))).await?;
+        assert_eq!(mailbox.status(queued.clone()).await?.unread_count, Some(1));
+
+        mailbox.clear().await?;
+        assert_eq!(mailbox.status(queued.clone()).await?.unread_count, Some(0));
+        assert_eq!(sub.status(), SubscriptionStatus::Active);
+
+        mailbox.post(mail("mem:rust-clear/sender", live.as_str(), json!({ "n": 2 }))).await?;
+        assert!(wait_until(|| {
+            let hits = hits.clone();
+            async move { hits.load(Ordering::SeqCst) >= 1 }
+        }).await, "清理之后旧订阅者必须照常收到新消息");
+
+        sub.unsubscribe().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_stop_keeps_the_backlog_while_stop_and_purge_drops_it() -> Result<()> {
+        // 关闭通道 ≠ 销毁数据：`stop()` 后同一个 scope 上的新 Mailbox 仍看得见残留（老行为）。
+        let scope = unique_scope("stop");
+        let addr = "mem:rust-stop/keeps-queue";
+
+        for purge in [false, true] {
+            let mut first = Mailbox::new();
+            first.register_provider(Box::new(MemoryProvider::for_scope(&scope, None)));
+            first.start().await?;
+            first.post(mail("mem:rust-stop/sender", addr, json!({ "n": 1 }))).await?;
+
+            if purge {
+                first.stop_and_purge().await?;
+            } else {
+                first.stop().await?;
+            }
+
+            let second = mailbox_with(Box::new(MemoryProvider::for_scope(&scope, None)));
+            second.start().await?;
+            let unread = second.status(addr.parse()?).await?.unread_count;
+            assert_eq!(unread, Some(if purge { 0 } else { 1 }), "purge = {purge}");
+            second.clear().await?; // 收尾：不把残留留给下一个用例
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_stop_and_purge_unsubscribes_then_drops_the_backlog() -> Result<()> {
+        let mailbox = mailbox_with(Box::new(MemoryProvider::create_isolated(None)));
+        let live = "mem:rust-purge/live";
+        let queued = "mem:rust-purge/queue";
+
+        let sub = mailbox.subscribe(live.parse()?, Box::new(|_| Box::pin(async { Ok(()) }))).await?;
+        // 有订阅者的地址：走广播，不入队。
+        mailbox.post(mail("mem:rust-purge/sender", live, json!({ "n": 0 }))).await?;
+        assert_eq!(mailbox.status(live.parse()?).await?.unread_count, Some(0));
+
+        mailbox.post(mail("mem:rust-purge/sender", queued, json!({ "n": 1 }))).await?;
+        mailbox.post(mail("mem:rust-purge/sender", queued, json!({ "n": 2 }))).await?;
+        let _taken = mailbox.fetch(queued.parse()?, FetchOptions { manual_ack: true, ..Default::default() }).await?;
+
+        let status = mailbox.status(queued.parse()?).await?;
+        assert_eq!(status.unread_count, Some(1));
+        assert_eq!(status.in_flight_count, Some(1));
+
+        mailbox.stop_and_purge().await?;
+
+        assert_eq!(sub.status(), SubscriptionStatus::Closed); // 先拆订阅
+        let status = mailbox.status(queued.parse()?).await?;
+        assert_eq!(status.unread_count, Some(0));
+        assert_eq!(status.in_flight_count, Some(0)); // in-flight 也算积压
+        assert_eq!(mailbox.status(live.parse()?).await?.unread_count, Some(0));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_stop_and_purge_tolerates_providers_without_a_clear_impl() -> Result<()> {
+        // 基类 `clear()` 是 no-op：provider 不实现它，`stop_and_purge()` 也不该报错。
+        let broker = remote("nostatus");
+        let sent = broker.sent.clone();
+        let mailbox = mailbox_with(Box::new(broker));
+        mailbox.start().await?;
+
+        mailbox.post(mail("nostatus:a/u", "nostatus:box/inbox", json!({ "n": 1 }))).await?;
+
+        mailbox.clear().await?;
+        mailbox.stop_and_purge().await?;
+        assert_eq!(sent.lock().unwrap().len(), 1); // broker 里的消息没被销毁
         Ok(())
     }
 }

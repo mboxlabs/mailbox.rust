@@ -152,8 +152,11 @@ non-parseable string into `InvalidMailboxAddress`.
 > `get_canonical_mailbox_address_identifier()` returns `Result<String>` (a lossy address is an
 > error, not a trimmed id). `MailboxStatus` gained `exists`, and `last_activity_time` is now
 > serialized as `null` instead of being skipped; `FetchOptions` gained `peek` / `limit`;
-> `MailboxProvider` gained the optional `peek` / `list_addresses`; `Mailbox` gained `peek()` and
-> `snapshot()`.
+> `MailboxProvider` gained the optional `peek` / `list_addresses` / `clear`; `Mailbox` gained
+> `peek()`, `snapshot()`, `clear()` and `stop_and_purge()` (`stop()` itself is unchanged and still
+> keeps the backlog). `MemoryEventBus` is public and shareable: `MemoryProvider::create_isolated()`,
+> `for_scope()`, `with_bus()` and `bus()` are new, while `MemoryProvider::new()` keeps the historic
+> process-wide bus.
 
 ## 🎯 Core Features
 
@@ -421,6 +424,64 @@ The policy pieces live in `mboxlabs_mailbox::retry` (`RetryPolicy`, `next_retry_
 `to_delivery_results`); both are re-exported from the crate root, so other packages can reuse the
 same backoff and accounting. The retriable check is `MailboxError::is_retriable()`.
 
+## 🧵 Instance isolation and state reset (`mem:` provider)
+
+`MemoryProvider` simulates a broker on an in-memory event bus. By default every `MemoryProvider`
+shares one process-wide bus (`MemoryEventBus::get_instance(None)`), so all `Mailbox` instances in
+the process see the same `mem:` queues and subscription tables, and that state outlives `stop()`.
+This is intentional — it is what lets two `Mailbox` instances talk to each other — but it means you
+have to choose the boundary explicitly when you want independence (host + plugin, kernel +
+provider, or tests that must not leak into each other):
+
+```rust
+// 1. Private bus — no one else in the process can see its queues or subscriptions.
+let isolated = MemoryProvider::create_isolated(None);
+
+// 2. Named namespace — shared within a scope, invisible across scopes.
+let tenant = MemoryProvider::for_scope("tenant-a", None);
+
+// 3. Bring your own bus — e.g. two Mailboxes that are meant to share one "server".
+//    Cloning a `MemoryEventBus` handle shares the same state (JS object-reference semantics).
+let shared = MemoryProvider::with_bus(MemoryEventBus::new(), None);
+```
+
+Isolation comes from **switching bus instances**, not from switching addresses: inside one bus the
+`mem:` address space is global, with no tenant prefix — cross-instance interference means two
+Mailboxes naming the same topic on the same bus.
+
+`stop()` never deletes messages: a provider that is closed and started again (or another Mailbox on
+the same bus) still sees the backlog. That is the behaviour `for_scope()` examples above rely on.
+To destroy it, call `stop_and_purge()` — the Rust spelling of TypeScript's `stop({ purge: true })`
+and Python's `stop(purge=True)`.
+
+Reset state without tearing subscriptions down:
+
+```rust
+mailbox.clear().await?;                    // every provider's backlog (queued + in-flight)
+provider.clear().await?;                   // only the bus this provider holds
+let dropped = provider.bus().clear(Some(&canonical_id)); // one topic; returns the message count
+```
+
+Caveats worth knowing:
+
+- `clear()` drops messages, never subscriptions. Closing a channel is `unsubscribe()` / `stop()`'s
+  job: tearing the listener down while the `Subscription` object still reports `active` is worse
+  than a leftover message.
+- Dropped in-flight messages stay dropped — a late `ack()` / `nack(requeue)` on them is a no-op, so
+  a cleared backlog cannot resurrect itself as a ghost message.
+- On a shared bus, `clear()` clears the whole `mem:` namespace of that bus — that is exactly what a
+  shared "server" means. Use `create_isolated()` / `for_scope()` when that is not what you want.
+- `MailboxProvider::clear()` is a **no-op by default**: purging AMQP / SQS / IMAP is a destructive
+  operation and those messages do not live in this process, so the base class must not decide it
+  for its subclasses.
+- The scope registry is never garbage-collected: a scope name generated per run (timestamp, random
+  id) pins its bus for the lifetime of the process. Use `create_isolated()` for throwaway state.
+- Unlike TypeScript, one provider instance cannot end up inside two `Mailbox` values
+  (`register_provider` takes `Box<dyn MailboxProvider>` — ownership moves), so the TS "provider is
+  shared by more than one Mailbox" warning has no Rust equivalent. The shared thing here is the
+  bus: `stop()` still only closes the subscriptions of the provider it was called on, while
+  `clear()` wipes queues that several Mailboxes share.
+
 ## 🏗️ Architecture
 
 ### Provider Trait
@@ -435,8 +496,13 @@ pub trait MailboxProvider: Send + Sync {
     /// Optional: Initialize connections, pre-warm caches
     async fn init(&self) -> Result<()> { Ok(()) }
 
-    /// Optional: release resources (`ProviderCore::close()` cancels subscriptions + pending retries)
+    /// Optional: release resources (`ProviderCore::close()` cancels subscriptions + pending retries).
+    /// Never purges the backlog — closing a channel is not destroying in-flight data.
     async fn close(&self) -> Result<()> { Ok(()) }
+
+    /// Optional: drop this provider's backlog (queued *and* in-flight); subscriptions untouched.
+    /// Default no-op: purging a real broker is destructive and its messages are not local.
+    async fn clear(&self) -> Result<()> { Ok(()) }
 
     /// Concrete: injects `mbx-sent-at`, then delegates to `_send`
     async fn send(&self, message: MailMessage) -> Result<MailMessage> { /* … */ }
@@ -534,7 +600,13 @@ class routes `peek` away from `_fetch`, Rust has no base class, and `fetch()` mu
   - Opt-in subscription retry (`RetryPolicy`); by default a failed subscriber only requeues
     the message and nothing re-invokes the callback
   - Dead-letter / retry-exhausted hooks, and a settle watchdog for stuck callbacks
-  - Thread-safe singleton event bus
+  - Per-instance state (`MemoryEventBus` is a shareable handle): the process-wide bus is still the
+    default, `create_isolated()` / `for_scope(scope, retry)` / `with_bus(bus, retry)` choose a
+    different boundary; `provider.bus()` exposes it and `bus.clear(Some(topic))` purges one topic
+  - Purge path: `MemoryProvider::clear()` / `Mailbox::clear()` / `Mailbox::stop_and_purge()` drop
+    queued **and** in-flight messages without touching subscriptions
+  - Thread-safe event bus; `MemoryEventBus::get_instance(Some(scope))` is a process-wide scope
+    registry, and the default scope (`DEFAULT_MEMORY_SCOPE`) is the historic global bus
 
 ## 🌐 WASM Support
 
@@ -610,6 +682,17 @@ Tests include:
 - Read-only peek (`providers/queue.rs` + `providers/memory.rs` + `mailbox.rs`): copies, no dequeue,
   no in-flight, no stale scan, no activity bump, `limit` covers the head only, in-flight messages
   stay out of the snapshot, and a provider without the capability errors instead of consuming
+- Instance boundaries (`providers/memory.rs`), mirroring the TypeScript `providers/memory.isolation.test.ts`
+  and Python `tests/test_memory_isolation.py`: the default bus is still process-wide (cross-Mailbox
+  delivery and "B can fetch A's message" are both asserted, not just the isolation path), the scope
+  registry hands out one bus per scope, private buses never enter it, and topics / queues /
+  in-flight / `last_activity` are invisible across buses — including `close()` on one instance
+  leaving another instance's subscriptions running, and retry / failure requeue landing on the own
+  bus only
+- Purge path (`providers/queue.rs` + `providers/memory.rs` + `mailbox.rs`): `clear()` counts what it
+  dropped, drops in-flight too, never tears subscriptions down (old subscribers still receive the
+  next message), cannot be undone by a late `ack()` / `nack(requeue)`, is idempotent, and skips
+  providers that do not implement `clear()`; `stop()` keeps the backlog, `stop_and_purge()` does not
 
 ## 📚 Examples
 

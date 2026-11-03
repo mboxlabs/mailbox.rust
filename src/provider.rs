@@ -124,8 +124,24 @@ pub trait MailboxProvider: Send + Sync {
      *
      * 走 [`crate::core::ProviderCore`] 的 provider 应转调 `ProviderCore::close()`：
      * 它会取消全部活跃订阅以及「等待重投」的投递。
+     *
+     * 注意：`close()` **不**清消息队列——“关掉通道”不等于“销毁在途数据”。要一并清掉积压消息
+     * 用 [`crate::Mailbox::stop_and_purge`] 或下面的 [`MailboxProvider::clear`]。
      */
     async fn close(&self) -> Result<()> {
+        Ok(())
+    }
+
+    /**
+     * 丢弃本 provider 持有的积压消息（含 in-flight），**不**动订阅。可选能力。
+     *
+     * 默认**空实现**：“清空传输”对 AMQP / SQS / IMAP 这类真实 broker 是破坏性运维操作，
+     * 消息也不在这个进程里，基类不能替子类下结论。需要 purge 语义的 provider（如
+     * [`crate::providers::memory::MemoryProvider`]）自己覆写；
+     * [`crate::Mailbox::stop_and_purge`] 对没覆写的 provider 就是 no-op。
+     */
+    async fn clear(&self) -> Result<()> {
+        // 默认无可清理内容：传输型 provider 的消息存在 broker 里，不在本地。
         Ok(())
     }
 

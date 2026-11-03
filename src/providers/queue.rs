@@ -186,6 +186,42 @@ where T: Clone + Identifiable
             .any(|queue| queue.iter().any(|queued| queued.id() == message_id))
     }
 
+    /// 清空队列状态：`topic = None` 则清空所有 topic。
+    ///
+    /// in-flight 的消息**也**会被丢弃：它同样是队列状态的一部分，只清「等待中」的那一半，
+    /// 下一轮（或同进程的另一个消费者 / 另一个测试用例）还是会看到残留消息（issue#3）。
+    /// 被丢弃的 in-flight 消息之后 `ack()` / `nack(requeue)` 都是 no-op —— 不会复活成幽灵消息
+    /// （两者都先查 in-flight 台账，记录已经被清掉了）。
+    ///
+    /// @param topic 只清这个 topic；`None` 则清空全部。
+    /// @returns 被丢弃的消息数（含 in-flight），便于诊断与断言。
+    pub fn clear(&mut self, topic: Option<&str>) -> usize {
+        let Some(topic) = topic else {
+            let dropped = self.in_flight.len()
+                + self.queues.values().map(|queue| queue.len()).sum::<usize>();
+            self.queues.clear();
+            self.in_flight.clear();
+            return dropped;
+        };
+
+        let mut dropped = 0;
+        // 连空数组一起删掉，不留尾巴：否则 `topics()` / `has_topic` 还能看到这个 topic。
+        if let Some(queue) = self.queues.remove(topic) {
+            dropped += queue.len();
+        }
+        for message_id in self
+            .in_flight
+            .iter()
+            .filter(|(_, flight)| flight.topic == topic)
+            .map(|(message_id, _)| message_id.clone())
+            .collect::<Vec<_>>()
+        {
+            self.in_flight.remove(&message_id);
+            dropped += 1;
+        }
+        dropped
+    }
+
     fn requeue_stale(&mut self, topic: &str, timeout: Duration) {
         let now = Instant::now();
         let mut stale_ids = Vec::new();
@@ -449,5 +485,69 @@ mod tests {
         assert_eq!(q.in_flight_count("t"), 0);
         assert_eq!(q.get_status("t"), 1);
         assert_eq!(q.dequeue("t").unwrap().id, "m2"); // nack(requeue) 回到队首
+    }
+
+    // issue#3：队列状态必须能被清掉，否则同一进程里的多个 Mailbox / 多个测试用例互相串台。
+    #[test]
+    fn clear_drops_only_the_given_topic_and_reports_the_count() {
+        let mut q = MailMessageQueue::new();
+        q.enqueue("t1".to_string(), msg("a"));
+        q.enqueue("t1".to_string(), msg("b"));
+        q.enqueue("t2".to_string(), msg("c"));
+
+        assert_eq!(q.clear(Some("t1")), 2);
+
+        assert_eq!(q.get_status("t1"), 0);
+        assert_eq!(q.in_flight_count("t1"), 0);
+        assert!(!q.has_topic("t1")); // 连空数组一起删了： topic 本身也不存在了
+        assert_eq!(q.get_status("t2"), 1);
+        assert_eq!(q.dequeue("t2").unwrap().id, "c");
+    }
+
+    #[test]
+    fn clear_drops_in_flight_too_and_a_late_ack_or_nack_cannot_resurrect_it() {
+        // in-flight 也是队列状态的一部分：只清「等待中」的那半，跑完一轮还是会看到残留。
+        let mut q = MailMessageQueue::new();
+        q.enqueue("t1".to_string(), msg("a"));
+        q.dequeue_for_ack("t1", Some(Duration::from_secs(30)));
+        assert_eq!(q.get_status("t1"), 0);
+        assert_eq!(q.in_flight_count("t1"), 1);
+
+        assert_eq!(q.clear(Some("t1")), 1);
+        assert_eq!(q.in_flight_count("t1"), 0);
+        assert!(!q.has("a"));
+
+        // 迟到的 ack / nack 不能再把已清理的消息放回队列（否则会“复活”成幽灵消息）。
+        q.ack("a");
+        q.nack("a", true);
+        assert_eq!(q.get_status("t1"), 0);
+        assert_eq!(q.in_flight_count("t1"), 0);
+        assert!(q.dequeue("t1").is_none());
+    }
+
+    #[test]
+    fn clear_without_a_topic_drops_every_topic() {
+        let mut q = MailMessageQueue::new();
+        q.enqueue("t1".to_string(), msg("a"));
+        q.enqueue("t2".to_string(), msg("b"));
+        q.dequeue_for_ack("t2", Some(Duration::from_secs(30)));
+
+        assert_eq!(q.clear(None), 2); // t1 的 1 条 + t2 的 1 条 in-flight
+        assert_eq!(q.clear(None), 0);
+        assert_eq!(q.topics(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn clear_is_idempotent_and_safe_on_an_unknown_topic() {
+        let mut q = MailMessageQueue::new();
+        q.enqueue("t1".to_string(), msg("a"));
+        assert_eq!(q.clear(Some("t1")), 1);
+        assert_eq!(q.clear(Some("t1")), 0);
+        assert_eq!(q.clear(Some("never-seen")), 0);
+        assert_eq!(q.clear(None), 0);
+
+        // 清空后队列还能照常使用
+        q.enqueue("t1".to_string(), msg("a"));
+        assert_eq!(q.dequeue("t1").unwrap().id, "a");
     }
 }
